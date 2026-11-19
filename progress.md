@@ -8,8 +8,9 @@ measure of compute cost, independent of how many threads happen to run. 9.9×
 means the job burns 9.9 CPU-seconds per audio-second. Wall-clock realtime factor
 is given next to it because that is what a user feels.
 
-Wall-clock times are local time (CET), taken from `date` at the moment of the
-run.
+Wall-clock times are local time (CET). The verification blocks and the commit
+times are exact readings from `date`; the change-point times in the log are
+approximate readings taken during the session and are marked `~`.
 
 Test signals: the 44.29 s recording `audio_…-maticna.wav`, and a 5 s excerpt of
 it at `/tmp/short5.wav`. The 5 s clip is used for iteration because the 44 s one
@@ -59,7 +60,7 @@ ordered by what that table implies, not by what looked expensive.
 
 ## Change log, with the measured effect of each step
 
-### 1. Memory layout: head-major keys and values (23:12)
+### 1. Memory layout: head-major keys and values (~23:00)
 
 `[band][slot][head*hd]` → `[band][head][slot][hd]`, and band attention's q/k/v
 transposed once per frame into `[frame][head][band][hd]`.
@@ -83,7 +84,7 @@ the layout is head-major (the head stride moves with the capacity); and the PV
 accumulation lost the zeroing of its destination because the new kernel writes
 with `+=`.
 
-### 2. Vectorised kernels (23:20)
+### 2. Vectorised kernels (~23:05)
 
 SDOT-free, portable xsimd: LayerNorm (three passes: sum, squared deviation,
 apply), RoPE, the softmax summation, the mamba depthwise convolution, and the
@@ -100,7 +101,7 @@ Numbers unchanged, because these ~5 s of work are only 12 % of the total and the
 were already partly auto-vectorised. The fusion did remove a full pass over
 `rows × state × inner` floats, which matters at low thread counts and for power.
 
-### 3. Pool latency: 18.9 s → 12.3 s at 6 threads (23:41)
+### 3. Pool latency: 18.9 s → 12.3 s at 6 threads (~23:12)
 
 This was the first real win, and it came from a measurement, not a guess:
 
@@ -130,7 +131,7 @@ step; with int8: 4: 7.3, 6: 6.8, 8: 7.4). Above six the pool spills out of one
 core cluster and every barrier waits for the slower cluster. The default is now
 `min(cores, 6)` on macOS, `min(cores, 8)` elsewhere.
 
-### 4. Do not parallelise what is smaller than a barrier (23:48)
+### 4. Do not parallelise what is smaller than a barrier (~23:20)
 
 LayerNorm and the residual add are 94k floats each; at one thread they cost 15 µs
 and 3 µs. At six threads they cost 0.53 s and 0.38 s over the clip — pure barrier
@@ -148,7 +149,7 @@ split cannot cut) split by rows instead.
 
 Verified: `vi_tests . quick` still 118.5 dB at the output, all stages ≥ 107 dB.
 
-### 5. int8 weights, int8 activations, SDOT (23:55)
+### 5. int8 weights, int8 activations, SDOT (~23:30)
 
 The hardware probe first: `__ARM_FEATURE_DOTPROD` and
 `__ARM_FEATURE_MATMUL_INT8` are both present, and `vdotq_s32` executes.
@@ -242,53 +243,7 @@ doing only if int8 quality ever has to improve.
 
 ---
 
-## Final state
-
-### Speed
-
-Measured with the machine otherwise idle; `user` is CPU time, so it is the
-number to compare across thread counts.
-
-| workload | threads | wall | user | user/audio | realtime | vs baseline |
-|---|---|---|---|---|---|---|
-| 5 s clip, fp32 | 1 | 38.95 s | 38.36 s | 7.67× | 0.13× | 1.03× |
-| 5 s clip, fp32 | 6 | 10.78 s | 42.21 s | 8.44× | 0.46× | 1.02× |
-| **44.29 s, fp32** | **6** | **112.3 s** | **420.3 s** | **9.49×** | **0.39×** | **1.09×** |
-| 5 s clip, int8 | 6 | 6.5 s | 23.0 s | 4.60× | 0.77× | 1.87× |
-| **44.29 s, int8** | **6** | **66.1 s** | **242.1 s** | **5.47×** | **0.67×** | **1.88×** |
-
-Against the baseline (44.29 s file, 8 threads, 163.5 s wall / 456 s user):
-
-* CPU cost of the whole model: 10.3 → 9.49 CPU-s per audio-s in fp32 (**1.09×**),
-  → 5.47 with int8 (**1.88× less compute**).
-* Wall clock: 163.5 s → 112.3 s (**1.46×**) → 66.1 s (**2.47×**).
-
-The wall-clock gain is larger than the CPU-time gain because most of it came from
-the pool and the thread count, not from doing less arithmetic. That is worth
-stating plainly: on this machine the fp32 kernels were already near Eigen's peak,
-so real compute reduction needed int8.
-
-### Where the remaining time goes (5 s clip)
-
-fp32, 6 threads: GEMM 7.83 of 11.00 s (71 %), scan 0.83, attention
-scores+values ~1.0, advance 0.18, LayerNorm 0.15.
-int8, 6 threads: GEMM 3.21 of 6.35 s (51 %), scan 0.77, attention ~1.0,
-convolution 0.19, LayerNorm 0.15.
-
-After int8 the profile is balanced: no single remaining pass is more than 15 % of
-the total except the GEMM itself, and that is now at 963 GFLOP/s of int8
-throughput.
-
-### Correctness gates
-
-- `vi_tests . quick`: every stage 107–122 dB, output samples **118.5 dB**
-  (unchanged by all of the above; the fp32 path is still the reference path).
-- `ctest`: full suite including the windowed 600/200 crossfade and the 20 s
-  cache-compaction case.
-- Full 44.29 s file vs the Python reference (`…-maticna.clean2.wav`):
-  **71.5 dB**, max 3.2e-05 — i.e. still at that file's PCM16 quantisation floor.
-
-### 6. Band attention as a GEMM, and the end of the int8 kernel work (00:25)
+### 6. Band attention as a GEMM, and the end of the int8 kernel work (~23:45)
 
 Band attention is 32 independent dense products of 46 x 46 x 64 per frame block.
 The hand-rolled version scored them with 64-wide dot products, which is a
@@ -349,7 +304,7 @@ like the pool splits it:
 | columns matching | 20 of 20 |
 | **scalar fallback vs SDOT path** | **bit-identical, max diff 0.0** |
 
-### Re-verification of the final binary (23:55)
+## Re-verification of the final binary (23:55:47 CET)
 
 Everything above was re-run after those fixes; the binary under test is the
 current source, not an earlier build.
@@ -364,6 +319,54 @@ current source, not an earlier build.
 | fp32 output vs the Python reference file | **71.5 dB**, max 3.21e-05 |
 | int8 vs fp32 | 20.6 dB |
 | sample counts | 2 125 746 vs 2 125 746 |
+
+## Final state
+
+### Speed
+
+Measured with the machine otherwise idle; `user` is CPU time, so it is the
+number to compare across thread counts. The 44.29 s rows are the re-verification
+run on the final binary (`ba93649`); wall clock moves ±5 % with thermal state,
+CPU time does not.
+
+| workload | threads | wall | user | user/audio | realtime | vs baseline |
+|---|---|---|---|---|---|---|
+| 5 s clip, fp32 | 1 | 38.95 s | 38.36 s | 7.67× | 0.13× | 1.03× |
+| 5 s clip, fp32 | 6 | 10.78 s | 42.21 s | 8.44× | 0.46× | 1.02× |
+| **44.29 s, fp32** | **6** | **111.9 s** | **417.8 s** | **9.43×** | **0.40×** | **1.09×** |
+| 5 s clip, int8 | 6 | 6.5 s | 23.0 s | 4.60× | 0.77× | 1.87× |
+| **44.29 s, int8** | **6** | **67.7 s** | **240.2 s** | **5.42×** | **0.66×** | **1.90×** |
+
+Against the baseline (44.29 s file, 8 threads, 163.5 s wall / 456 s user):
+
+* CPU cost of the whole model: 10.3 → 9.43 CPU-s per audio-s in fp32 (**1.09×**),
+  → 5.42 with int8 (**1.90× less compute**).
+* Wall clock: 163.5 s → 111.9 s (**1.46×**) → 67.7 s (**2.41×**).
+
+The wall-clock gain is larger than the CPU-time gain because most of it came from
+the pool and the thread count, not from doing less arithmetic. That is worth
+stating plainly: on this machine the fp32 kernels were already near Eigen's peak,
+so real compute reduction needed int8.
+
+### Where the remaining time goes (5 s clip)
+
+fp32, 6 threads: GEMM 7.83 of 11.00 s (71 %), scan 0.83, attention
+scores+values ~1.0, advance 0.18, LayerNorm 0.15.
+int8, 6 threads: GEMM 3.21 of 6.35 s (51 %), scan 0.77, attention ~1.0,
+convolution 0.19, LayerNorm 0.15.
+
+After int8 the profile is balanced: no single remaining pass is more than 15 % of
+the total except the GEMM itself, and that is now at 963 GFLOP/s of int8
+throughput.
+
+### Correctness gates
+
+- `vi_tests . quick`: every stage 107–122 dB, output samples **119.0 dB**
+  (the fp32 path is still the reference path).
+- `ctest`: full suite including the windowed 600/200 crossfade and the 20 s
+  cache-compaction case — **1/1 passed in 236.72 s** on the final binary.
+- Full 44.29 s file vs the Python reference (`…-maticna.clean2.wav`):
+  **71.5 dB**, max 3.2e-05 — i.e. still at that file's PCM16 quantisation floor.
 
 ### What I tried that did not pay off
 
