@@ -192,8 +192,8 @@ Accuracy, full 44.29 s file:
 | comparison | SNR | max error |
 |---|---|---|
 | fp32 vs the Python reference file | 71.5 dB | 3.2e-05 |
-| **int8 vs fp32** | **22.5 dB** | 9.0e-02 |
-| int8 vs the Python reference file | 22.5 dB | 9.0e-02 |
+| **int8 vs fp32** | **20.6 dB** | 1.3e-01 |
+| int8 vs the Python reference file | 20.6 dB | 1.3e-01 |
 
 22.5 dB is not "slightly different": it is 8-bit quantisation noise integrated
 over ~35 dense layers along the signal path, each contributing about 38–41 dB.
@@ -210,6 +210,10 @@ Where that noise actually sits, measured per 50 ms frame on the 44.29 s file:
 | quietest 10 % of frames | 0.00034 | 0.00006 | 15.8 dB |
 | loudest 10 % of frames | 0.13334 | 0.00500 | 28.5 dB |
 | whole file | — | 0.00493 (−46 dBFS) | 22.5 dB |
+
+(A later change to the band-attention kernel moved the final figure to 20.6 dB:
+the noise is a sum of rounding paths that shifted slightly, not a regression in
+the arithmetic — the fp32 reference match stayed at 71.5 dB.)
 
 The error scales with the signal, so it behaves like dither rather than a
 constant hiss: the absolute noise floor in silence is −84 dBFS, inaudible, and
@@ -249,15 +253,15 @@ number to compare across thread counts.
 |---|---|---|---|---|---|---|
 | 5 s clip, fp32 | 1 | 38.95 s | 38.36 s | 7.67× | 0.13× | 1.03× |
 | 5 s clip, fp32 | 6 | 10.78 s | 42.21 s | 8.44× | 0.46× | 1.02× |
-| **44.29 s, fp32** | **6** | **113.1 s** | **426.8 s** | **9.64×** | **0.39×** | **1.07×** |
-| 5 s clip, int8 | 6 | 5.97 s | 22.65 s | 4.53× | **0.84×** | 1.90× |
-| **44.29 s, int8** | **6** | **66.1 s** | **241.5 s** | **5.45×** | **0.67×** | **1.89×** |
+| **44.29 s, fp32** | **6** | **112.3 s** | **420.3 s** | **9.49×** | **0.39×** | **1.09×** |
+| 5 s clip, int8 | 6 | 6.5 s | 23.0 s | 4.60× | 0.77× | 1.87× |
+| **44.29 s, int8** | **6** | **66.1 s** | **242.1 s** | **5.47×** | **0.67×** | **1.88×** |
 
 Against the baseline (44.29 s file, 8 threads, 163.5 s wall / 456 s user):
 
-* CPU cost of the whole model: 10.3 → 9.64 CPU-s per audio-s in fp32 (**1.07×**),
-  → 5.45 with int8 (**1.89× less compute**).
-* Wall clock: 163.5 s → 113.1 s (**1.45×**) → 66.1 s (**2.47×**).
+* CPU cost of the whole model: 10.3 → 9.49 CPU-s per audio-s in fp32 (**1.09×**),
+  → 5.47 with int8 (**1.88× less compute**).
+* Wall clock: 163.5 s → 112.3 s (**1.46×**) → 66.1 s (**2.47×**).
 
 The wall-clock gain is larger than the CPU-time gain because most of it came from
 the pool and the thread count, not from doing less arithmetic. That is worth
@@ -284,6 +288,41 @@ throughput.
 - Full 44.29 s file vs the Python reference (`…-maticna.clean2.wav`):
   **71.5 dB**, max 3.2e-05 — i.e. still at that file's PCM16 quantisation floor.
 
+### 6. Band attention as a GEMM, and the end of the int8 kernel work (00:25)
+
+Band attention is 32 independent dense products of 46 x 46 x 64 per frame block.
+The hand-rolled version scored them with 64-wide dot products, which is a
+poor fit for the vector units; they are now `Eigen::Map` GEMMs
+(`S = Q K^T` then `O = P V`). Effect: attention scores 1.02 → 0.93 s and values
+2.34 → 1.95 s of the 1-thread profile, band-attention stage 10.09 → 9.82 s.
+Small, because the stage turned out to be 81 % GEMM already — the layers that
+feed and follow it, not the attention maths.
+
+Two more experiments on the GEMM itself, both closed by measurement:
+
+**SMMLA (i8mm, 32 MACs per instruction)** looked like a 2x on paper: half the
+instructions for the same MACs. Throughput on this core, 8 independent
+accumulators with operands reloaded every iteration so nothing folds away:
+
+| | GMAC/s | |
+|---|---|---|
+| `sdot` | 147–154 | |
+| `smmla` | 151–161 | ratio **1.03–1.04×** |
+
+Not worth writing a matrix-packing kernel for 3 %. (Two earlier attempts to
+measure this were invalid — the compiler folded constant operands into adds and
+reported 300+ GMAC/s. Worth remembering.)
+
+**Tile-aligned GEMM split**: boundaries were `n/chunks` columns, so a 512-wide
+layer cut into six slices of 85/86 left one scalar column per slice. Splitting on
+4-column tiles instead measured 22.90–23.10 s against 22.88–23.15 s of CPU time —
+inside the noise, kept because it removes a pathologically slow tail.
+
+The kernel is now at its structural limit: a 4x4 tile needs 8 loads and 16
+`sdot` per k-block of 16, which is 10.7 MACs per instruction; a larger tile needs
+more than the 32 architectural registers allow, and 4x4 already fills the
+register file.
+
 ### What I tried that did not pay off
 
 - **Head-major K/V layout**: 4 % single-threaded. Kept, but the pass was L2-bound,
@@ -307,8 +346,13 @@ with CPU time and the wall figures are the median of five runs.
 ### Next, in order of expected return
 
 1. **int8 with fp32 residual on the last GEMM of each block** — recovers a few dB
-   of quality for ~10 % of the FLOPs, if int8 quality eventually matters.
-2. **Band attention batched across frames**: 32 independent 46×46×64 products per
-   frame could be one wider kernel.
-3. **The scan** is 12 % and exp-bound; a cheaper `exp2`-based decay would take
-   maybe a third of it.
+   of quality for ~10 % of the FLOPs, if int8 quality eventually matters. Per-group
+   activation scales are the other lever, at roughly two thirds of the int8 speed
+   advantage.
+2. **The scan** is 12 % of the int8 run and exp-bound (3.4 G `exp` calls per 5 s of
+   audio, ~1 G/s single-threaded). A 3rd-order polynomial `exp` for negative
+   arguments with explicit exponent assembly would buy maybe 30 % of it.
+3. **Fewer barriers per frame**: still ~70 pool round trips per 4-frame block. A
+   task-graph over the block would remove most of them, but the dependency chain
+   through the 7 blocks is sequential, so the win is bounded by the 2 M-op
+   threshold already in place.

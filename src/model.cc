@@ -475,10 +475,13 @@ bool Model::linear_par_i8(const float* a, int m, int k, int stride,
   if (sc.q8.size() < need_q) sc.q8.resize(need_q);
   if (sc.q8s.size() < static_cast<size_t>(chunks) * m)
     sc.q8s.resize(static_cast<size_t>(chunks) * m);
+  // Split on 4-column tiles so every worker covers whole tiles: a boundary
+  // that is not a multiple of 4 leaves a scalar tail that dominates its slice.
+  const int tiles = n / 4;
   default_pool().parallel_for(chunks, [&](int index) {
-    const int j0 = static_cast<int>(static_cast<int64_t>(n) * index / chunks);
+    const int j0 = static_cast<int>(4 * static_cast<int64_t>(tiles) * index / chunks);
     const int j1 =
-        static_cast<int>(static_cast<int64_t>(n) * (index + 1) / chunks);
+        static_cast<int>(4 * static_cast<int64_t>(tiles) * (index + 1) / chunks);
     if (j1 <= j0) return;
     gemm_int8_columns(a, m, k, stride, *qw, bias, c, j0, j1,
                       sc.q8.data() + static_cast<size_t>(index) * m * k,
@@ -863,33 +866,41 @@ void Model::band_transformer(const AttnWeights& w, float* feat,
   }
 
   const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
-  const bool pf_single = profile_enabled() && default_pool().size() == 1;
   const float* qall = sc.bqkv.data();
   const float* kall = qall + per_unit * units;
   const float* vall = kall + per_unit * units;
+  // Each (frame, head) is a dense 46 x 46 x 64 product, so it is a GEMM, not a
+  // loop of dot products: 32 of them per frame block. Eigen does the packing
+  // once per call and runs at tens of GFLOP/s where the hand-rolled kernel ran
+  // at under two.
   default_pool().parallel_for(units, [&](int unit) {
     const float* q = qall + static_cast<size_t>(unit) * per_unit;
     const float* k = kall + static_cast<size_t>(unit) * per_unit;
     const float* v = vall + static_cast<size_t>(unit) * per_unit;
     const int f = unit / heads;
     const int h = unit % heads;
-    float* out = sc.attn.data() + static_cast<size_t>(f) * bands * width + h * hd;
     float* scores = sc.bscores.data() + static_cast<size_t>(unit) * bands * bands;
+    Eigen::Map<const RowMajor> qm(q, bands, hd);
+    Eigen::Map<const RowMajor> km(k, bands, hd);
+    Eigen::Map<const RowMajor> vm(v, bands, hd);
+    Eigen::Map<RowMajor> sm(scores, bands, bands);
+    sm.noalias() = qm * km.transpose();
     for (int i = 0; i < bands; ++i) {
       float* s = scores + static_cast<size_t>(i) * bands;
-      float sum;
-      {
-        Timer slot(pf_single ? &profile().attn_scores : nullptr);
-        sum = scores_softmax(q + static_cast<size_t>(i) * hd, k, bands, hd,
-                             scale, s);
+      float maxs = -INFINITY;
+      for (int j = 0; j < bands; ++j) {
+        s[j] *= scale;
+        maxs = std::max(maxs, s[j]);
       }
-      const float inv = 1.0f / sum;
-      float* o = out + static_cast<size_t>(i) * width;
-      {
-        Timer slot(pf_single ? &profile().attn_pv : nullptr);
-        pv_row(s, inv, v, bands, hd, o);
-      }
+      for (int j = 0; j < bands; ++j) s[j] -= maxs;
+      v_exp(s, bands);
+      const float inv = 1.0f / v_sum(s, bands);
+      for (int j = 0; j < bands; ++j) s[j] *= inv;
     }
+    float* out = sc.attn.data() + static_cast<size_t>(f) * bands * width + h * hd;
+    Eigen::Map<RowMajor, 0, Eigen::OuterStride<Eigen::Dynamic>> om(
+        out, bands, hd, Eigen::OuterStride<Eigen::Dynamic>(width));
+    om.noalias() = sm * vm;
   });
   // Exclusive self attention is off across bands for this checkpoint.
   linear_par(sc.attn.data(), rows, width, *w.out_w, w.out_b->data,
