@@ -15,11 +15,11 @@ numerically faithful to it, verified stage by stage.
 | algorithmic latency | **3 968 samples = 82.7 ms** (2048-sample window + 4 frames × 480 look-ahead) |
 | parameters | 58 178 056, fp32 (233 MB) |
 | peak RSS | 1.07 GB (weights + streaming state) |
-| speed on Apple M4 Max, fp32, 6 threads | **0.39× realtime** (114 s for 44 s of audio; 9.95 CPU-s per audio-s) |
-| speed, int8 weights (`--quant int8`), 6 threads | **0.65× realtime** (68 s for 44 s; 5.55 CPU-s per audio-s) |
+| speed on Apple M4 Max, fp32, 6 threads | **0.39× realtime** (112 s for 44 s of audio; 9.49 CPU-s per audio-s) |
+| speed, int8 weights (`--quant int8`), 6 threads | **0.67× realtime** (66 s for 44 s; 5.47 CPU-s per audio-s) |
 | speed, 1 thread, fp32 | 0.13× realtime |
 | output vs the Python reference, fp32 | 71.5 dB SNR on a 44 s file (PCM16 floor ≈ 77.5 dB) |
-| output vs fp32, `--quant int8` | 24.7 dB SNR (8-bit noise, −84 dBFS floor in silence) |
+| output vs fp32, `--quant int8` | 20.6 dB SNR (8-bit noise, −84 dBFS floor in silence) |
 
 The model is GPU-class (the Python reference itself runs on MPS at ~4×
 realtime). On a CPU it is compute-bound; see [Performance](#performance).
@@ -167,8 +167,8 @@ slower one.
 
 | path | wall | user | CPU-s per audio-s | realtime |
 |---|---|---|---|---|
-| fp32 | 114.2 s | 440.7 s | 9.95 | 0.39× |
-| `--quant int8` | 68.0 s | 245.8 s | 5.55 | 0.65× |
+| fp32 | 112.3 s | 420.3 s | 9.49 | 0.39× |
+| `--quant int8` | 66.1 s | 242.1 s | 5.47 | 0.67× |
 | fp32, 1 thread | — | 39.5 s per 5 s | 7.9 | 0.13× |
 
 Where the time goes, 5 s clip, 6 threads (`--profile`):
@@ -196,10 +196,10 @@ is the same code NumPy uses, and single-thread Eigen reaches 80 GFLOP/s on the
 model's shapes (82 GFLOP/s on a 1024³ square), which is Eigen's practical fp32
 peak here.
 
-`--quant int8` is opt-in because it is lossy: 24.7 dB against the fp32 output,
-which is signal-correlated 8-bit noise rather than a hiss, with a −84 dBFS floor
-in silence. Per-group scales would improve it at roughly two thirds of the int8
-speed advantage.
+`--quant int8` is opt-in because it is lossy: 20.6 dB against the fp32 output,
+which is signal-correlated 8-bit noise rather than a hiss (loudest 10 % of frames
+28.5 dB, quietest 10 % 15.8 dB, absolute floor −84 dBFS in silence). Per-group
+scales would improve it at roughly two thirds of the int8 speed advantage.
 
 ## Tests
 
