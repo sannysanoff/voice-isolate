@@ -114,12 +114,6 @@ inline void rope_head(float* x, int head_dim, const float* cos,
   }
 }
 
-inline void rope_all(float* x, int width, int head_dim, const float* cos,
-                     const float* sin, bool inverse) {
-  for (int base = 0; base < width; base += head_dim)
-    rope_head(x + base, head_dim, cos, sin, inverse);
-}
-
 // Vector helpers for the attention inner loops: contiguous `count`-wide
 // vectors, four keys at a time so one load of the query feeds four dots.
 inline float dot(const float* a, const float* b, int count) {
@@ -462,7 +456,7 @@ const Int8Matrix* Model::quantized(const Tensor& w) const {
 
 bool Model::linear_par_i8(const float* a, int m, int k, int stride,
                           const Tensor& w, const float* bias, float* c) const {
-  if (!quant_enabled_) return false;
+  if (!quant_enabled_ || !int8_available()) return false;
   const int n = w.dim(0);
   // sdot consumes 16 int8 per instruction and the kernel tiles four columns.
   if (k % 16 != 0 || n % 4 != 0) return false;

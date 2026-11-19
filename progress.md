@@ -323,6 +323,48 @@ The kernel is now at its structural limit: a 4x4 tile needs 8 loads and 16
 more than the 32 architectural registers allow, and 4x4 already fills the
 register file.
 
+### 7. Portable int8 fallback: a race that was never run (23:57)
+
+Reviewing the int8 kernel for other machines turned up a real defect: the
+non-SDOT fallback ignored its column range and wrote all `n` columns, so on a
+build without the dot-product extension every worker in the pool would have
+overwritten the same output. It could never have triggered on this Mac, which is
+exactly why it survived — the path is dead here.
+
+Fixed to honour `[j0, j1)`, and the int8 path is now gated on
+`int8_available()`: without a vectorised dot product the scalar version is
+*slower* than fp32, so `--quant int8` silently does nothing there instead of
+pretending to help.
+
+Verified by building `gemm_int8.cc` twice, with `-march=armv8-a` (no dotprod, so
+the scalar path runs) and `-march=native` (sdot), on a matrix deliberately sized
+`m = 7, k = 32, n = 20` — not multiples of 4 — and split into three column ranges
+like the pool splits it:
+
+| check | result |
+|---|---|
+| `int8_available()` without dotprod / with | 0 / 1 |
+| output slots left untouched after a 3-way split | 0 of 140 |
+| max error vs a NumPy reference of the same arithmetic | 1.1e-07 |
+| columns matching | 20 of 20 |
+| **scalar fallback vs SDOT path** | **bit-identical, max diff 0.0** |
+
+### Re-verification of the final binary (23:55)
+
+Everything above was re-run after those fixes; the binary under test is the
+current source, not an earlier build.
+
+| check | result |
+|---|---|
+| `cmake --build build` | clean, no warnings |
+| `./build/vi_tests . quick` | all tests passed, output samples **119.0 dB** |
+| `ctest --test-dir build` | **1/1 passed in 236.72 s** |
+| 44.29 s file, fp32, 6 threads | 111.9 s wall / 417.8 s user = **9.43 CPU-s per audio-s**, 0.40× realtime |
+| 44.29 s file, int8, 6 threads | 67.7 s wall / 240.2 s user = **5.42 CPU-s per audio-s**, 0.66× realtime |
+| fp32 output vs the Python reference file | **71.5 dB**, max 3.21e-05 |
+| int8 vs fp32 | 20.6 dB |
+| sample counts | 2 125 746 vs 2 125 746 |
+
 ### What I tried that did not pay off
 
 - **Head-major K/V layout**: 4 % single-threaded. Kept, but the pass was L2-bound,

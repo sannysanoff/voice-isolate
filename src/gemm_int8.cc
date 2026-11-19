@@ -24,6 +24,8 @@ namespace vi {
 // work and does not.
 inline float row_range(const float* row, int k) { return v_absmax(row, k); }
 
+bool int8_available() { return VI_HAS_SDOT != 0; }
+
 void quantize_rows(const float* w, int n, int k, Int8Matrix& out) {
   out.n = n;
   out.k = k;
@@ -163,12 +165,11 @@ void gemm_int8_columns(const float* a, int m, int k, int stride,
     }
   }
 #else
-  // Portable fallback: same arithmetic, one scalar dot per output element.
-  (void)j0;
-  (void)j1;
+  // Portable fallback: same arithmetic, one scalar dot per output element. The
+  // column range has to be honoured, because workers own disjoint slices.
   for (int i = 0; i < m; ++i) {
     const int8_t* ar = aq + static_cast<size_t>(i) * k;
-    for (int j = 0; j < n; ++j) {
+    for (int j = j0; j < j1; ++j) {
       const int8_t* wr = w.q.data() + static_cast<size_t>(j) * k;
       int32_t s = 0;
       for (int t = 0; t < k; ++t) s += ar[t] * wr[t];

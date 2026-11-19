@@ -23,6 +23,10 @@ struct Int8Matrix {
   int k = 0;
 };
 
+// True when the build has a vectorised int8 dot product. Without one the int8
+// path is a scalar fallback and is slower than fp32, so callers skip it.
+bool int8_available();
+
 // Quantises an [n][k] row-major matrix, one symmetric scale per row.
 void quantize_rows(const float* w, int n, int k, Int8Matrix& out);
 
