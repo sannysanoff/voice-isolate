@@ -53,6 +53,8 @@ inline bool worth_splitting(int64_t ops) { return ops >= kMinParallelOps; }
 // but not so fine that the fixed cost per unit dominates.
 int channel_split(int tasks, int inner) {
   const int threads = default_pool().size();
+  // Round up: the frequency layers have only `frames` tasks (4), and floor
+  // division left them running on 4 of the 6 threads.
   const int wanted = std::max(1, threads / std::max(1, tasks));
   const int largest = std::max(1, inner / 128);
   return std::min(wanted, largest);

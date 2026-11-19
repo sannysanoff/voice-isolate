@@ -293,6 +293,16 @@ throughput.
   measurable effect; the 6-vs-8 thread cliff is a cluster boundary, not a
   scheduling hint.
 - **8 or more threads**: consistently worse than 6 on this CPU for both paths.
+- **Rounding the channel split up** so the frequency Mamba (4 tasks) fills all six
+  threads: 6.56–6.90 s against 6.20–6.65 s with the plain floor division, same
+  CPU time. The extra workers stream the same task's buffers and lose more to
+  locality than they gain in parallelism.
+- **Clipping the quantisation range at 4σ** (section 5): the sparse layers use
+  the spike as their signal, and the output collapsed to silence.
+
+A note on measurement noise: `user` CPU time is stable to about 3 % run to run,
+while wall clock moves ±5 % with thermal state. That is why the tables above lead
+with CPU time and the wall figures are the median of five runs.
 
 ### Next, in order of expected return
 
