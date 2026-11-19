@@ -15,9 +15,11 @@ numerically faithful to it, verified stage by stage.
 | algorithmic latency | **3 968 samples = 82.7 ms** (2048-sample window + 4 frames × 480 look-ahead) |
 | parameters | 58 178 056, fp32 (233 MB) |
 | peak RSS | 1.07 GB (weights + streaming state) |
-| speed on Apple M4 Max, 8 threads | **0.27–0.35× realtime** (~165 s for 44 s of audio) |
-| speed, 1 thread | 0.11× realtime |
-| output vs the Python reference | 71.4 dB SNR on a 44 s file (PCM16 floor ≈ 77.5 dB) |
+| speed on Apple M4 Max, fp32, 6 threads | **0.39× realtime** (114 s for 44 s of audio; 9.95 CPU-s per audio-s) |
+| speed, int8 weights (`--quant int8`), 6 threads | **0.65× realtime** (68 s for 44 s; 5.55 CPU-s per audio-s) |
+| speed, 1 thread, fp32 | 0.13× realtime |
+| output vs the Python reference, fp32 | 71.5 dB SNR on a 44 s file (PCM16 floor ≈ 77.5 dB) |
+| output vs fp32, `--quant int8` | 24.7 dB SNR (8-bit noise, −84 dBFS floor in silence) |
 
 The model is GPU-class (the Python reference itself runs on MPS at ~4×
 realtime). On a CPU it is compute-bound; see [Performance](#performance).
@@ -63,7 +65,8 @@ streaming position (the checkpoint offers 0, 2 and 4 frames).
 Options: `--block-frames N` (throughput only, default 4), `--window-frames N`
 (time-attention window, default 600, `0` disables the windows),
 `--crossfade-frames N` (default 200), `--cache-frames N`, `--threads N`,
-`--float32` (default output is PCM16, peak-normalised), `--profile`.
+`--float32` (default output is PCM16, peak-normalised), `--quant int8`,
+`--profile`.
 
 ### As a filter — samples in, samples out
 
@@ -157,24 +160,46 @@ non-zero), and the wrappers' `output_proj` layers have biases.
 
 ## Performance
 
-Measured on an M4 Max (10 P + 4 E cores), 44.29 s file:
+Measured on an M4 Max (10 performance + 4 efficiency cores), 44.29 s file,
+6 threads — the best thread count on this machine for both paths, since above
+six the pool spills out of one core cluster and every barrier waits for the
+slower one.
+
+| path | wall | user | CPU-s per audio-s | realtime |
+|---|---|---|---|---|
+| fp32 | 114.2 s | 440.7 s | 9.95 | 0.39× |
+| `--quant int8` | 68.0 s | 245.8 s | 5.55 | 0.65× |
+| fp32, 1 thread | — | 39.5 s per 5 s | 7.9 | 0.13× |
+
+Where the time goes, 5 s clip, 6 threads (`--profile`):
 
 ```
-encode 0.10 s   time_attn 50.6 s   band_attn 37.2 s   mamba 63.0 s
-decode 2.8 s    (stages 153.7 s of 165.4 s wall = 93%)
+fp32:  gemm 7.83   time_attn 3.12  band_attn 2.52  mamba 4.61  decode 0.15
+int8:  gemm 3.21   time_attn 1.86  band_attn 1.21  mamba 2.78  decode 0.13
+       (the attention and mamba figures include their own GEMMs)
 ```
 
-* 0.11× realtime on one thread, **0.35× on 6 threads**, 0.31× on 8, worse above
-  that: the pool re-synchronises at every GEMM (~70 barriers per frame), so
-  extra cores return less than the barrier and memory-traffic cost. 8 threads is
-  the default (`min(cores, 8)`); `--threads` overrides it.
-* The kernels are the limiting factor, not the FFT: per frame the model is
-  ~3.2 GFLOP, and realtime at 100 frames/s would need ~320 GFLOP/s sustained —
-  about half of the whole M4 Max CPU's fp32 peak. Expect realtime only on a GPU.
+The dense layers are 76 % of the fp32 run, so that is where the work went:
 
-Reaching realtime on CPU would need quantisation (next step) plus a wider
-compute backend. The single biggest present win is done already: GEMMs are
-split by output columns so threads stream disjoint weight slices.
+* They are split by **output columns**, so threads stream disjoint weight slices.
+* The pool spins for 20 000 `cpu_relax` rounds before blocking for 200 µs. The
+  old 2 ms condition-variable sleep let one late worker stall every barrier;
+  isolated GEMM throughput used to vary between 245 and 485 GFLOP/s run to run.
+* Passes estimated at under 2 M operations are **not** split: LayerNorm and the
+  residual add are 94 k floats each and cost more in barriers than in work.
+* **int8 weights and activations** with the NEON `sdot` instruction: 16 MACs per
+  instruction instead of 4, and a quarter of the weight stream. 963 GFLOP/s
+  against 418 GFLOP/s for fp32 at six threads (2.3×).
+
+Sample-exact kernels are not the limit: the FFT is 0.1 s of the run, pocketfft
+is the same code NumPy uses, and single-thread Eigen reaches 80 GFLOP/s on the
+model's shapes (82 GFLOP/s on a 1024³ square), which is Eigen's practical fp32
+peak here.
+
+`--quant int8` is opt-in because it is lossy: 24.7 dB against the fp32 output,
+which is signal-correlated 8-bit noise rather than a hiss, with a −84 dBFS floor
+in silence. Per-group scales would improve it at roughly two thirds of the int8
+speed advantage.
 
 ## Tests
 

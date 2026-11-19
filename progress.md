@@ -25,8 +25,13 @@ fp32, Eigen 3.4, `-O3 -fno-math-errno`, no `-march=native`.
 | workload | threads | wall | user | user/audio |
 |---|---|---|---|---|
 | 5 s clip | 1 | 41.35 s | 39.5 s | 7.9× |
-| 5 s clip | 6 | 14.12 s | ~43 s | 8.6× |
+| 5 s clip | 6 | 14.12 s | not recorded | — |
 | 44.29 s file | 8 | 163.5 s | 456 s | 10.3× |
+
+(The 44.29 s file is the honest baseline: the 5 s clip never fills the
+600-frame attention window, so it is about 1.8× cheaper per second of audio than
+steady state. Comparing the 5 s clip across changes is still valid; comparing it
+to the 44 s file is not.)
 
 Stage split of the 5 s clip, 1 thread (wall): encode 0.03, time attention 12.92,
 band attention 10.57, mamba 15.23, decode 0.70.
@@ -237,17 +242,27 @@ doing only if int8 quality ever has to improve.
 
 ### Speed
 
+Measured with the machine otherwise idle; `user` is CPU time, so it is the
+number to compare across thread counts.
+
 | workload | threads | wall | user | user/audio | realtime | vs baseline |
 |---|---|---|---|---|---|---|
-| 5 s clip, fp32 | 1 | 39.8 s | 38.9 s | 7.8× | 0.13× | 1.04× |
-| 5 s clip, fp32 | 6 | 11.0 s | ~44 s | 8.8× | 0.45× | 1.28× |
-| 44.29 s, fp32 | 6 | 114.2 s | 440.7 s | 9.95× | 0.39× | 1.43× |
-| 5 s clip, int8 | 6 | 6.8 s | ~26 s | 5.2× | **0.73×** | 2.08× |
-| **44.29 s, int8** | **6** | **68.0 s** | **245.8 s** | **5.55×** | **0.65×** | **2.40×** |
+| 5 s clip, fp32 | 1 | 38.95 s | 38.36 s | 7.67× | 0.13× | 1.03× |
+| 5 s clip, fp32 | 6 | 10.78 s | 42.21 s | 8.44× | 0.46× | 1.02× |
+| **44.29 s, fp32** | **6** | **113.1 s** | **426.8 s** | **9.64×** | **0.39×** | **1.07×** |
+| 5 s clip, int8 | 6 | 5.97 s | 22.65 s | 4.53× | **0.84×** | 1.90× |
+| **44.29 s, int8** | **6** | **66.1 s** | **241.5 s** | **5.45×** | **0.67×** | **1.89×** |
 
-CPU-time cost of the whole model fell from 10.3 to 5.55 CPU-seconds per
-audio-second — a **1.86× reduction** — and wall time on the long file went from
-163.5 s to 68.0 s.
+Against the baseline (44.29 s file, 8 threads, 163.5 s wall / 456 s user):
+
+* CPU cost of the whole model: 10.3 → 9.64 CPU-s per audio-s in fp32 (**1.07×**),
+  → 5.45 with int8 (**1.89× less compute**).
+* Wall clock: 163.5 s → 113.1 s (**1.45×**) → 66.1 s (**2.47×**).
+
+The wall-clock gain is larger than the CPU-time gain because most of it came from
+the pool and the thread count, not from doing less arithmetic. That is worth
+stating plainly: on this machine the fp32 kernels were already near Eigen's peak,
+so real compute reduction needed int8.
 
 ### Where the remaining time goes (5 s clip)
 
