@@ -1,0 +1,7 @@
+build/
+build-*/
+.venv/
+*.wav
+model/
+ref/
+__pycache__/
