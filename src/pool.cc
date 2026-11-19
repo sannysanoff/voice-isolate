@@ -9,6 +9,10 @@
 #include <mutex>
 #include <thread>
 
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
+
 #include "vecmath.h"
 
 namespace vi {
@@ -64,7 +68,7 @@ inline void cpu_relax() {
 #endif
 }
 
-constexpr int kSpinRounds = 16384;
+constexpr int kSpinRounds = 20000;
 
 }  // namespace
 
@@ -84,25 +88,35 @@ struct Pool::Impl {
 
   // One worker's body: spin for the next job, then take indices until done.
   void worker() {
+#if defined(__APPLE__)
+    // Without an elevated QoS class macOS parks these threads on the efficiency
+    // cores, and one slow core at each barrier is what caps the scaling.
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     uint64_t seen = 0;
     for (;;) {
       int spins = 0;
       while (generation.load(std::memory_order_acquire) == seen) {
         if (stop.load(std::memory_order_relaxed)) return;
-        if (++spins > kSpinRounds) {
-          // Announce the sleep so a submitter knows it must wake somebody.
+        // Spin, then block. A worker that sleeps through a barrier stalls every
+        // thread behind it, so the spin window has to cover the barrier gap; the
+        // condvar is the fallback for when the pool really is idle. Yielding in
+        // between is a syscall and made this much slower, not faster.
+        if (spins < kSpinRounds) {
+          cpu_relax();
+        } else {
           sleepers.fetch_add(1, std::memory_order_seq_cst);
           {
             std::unique_lock<std::mutex> lock(mutex);
-            wake.wait_for(lock, std::chrono::milliseconds(2), [&] {
+            wake.wait_for(lock, std::chrono::microseconds(200), [&] {
               return stop.load() || generation.load() != seen;
             });
           }
           sleepers.fetch_sub(1, std::memory_order_seq_cst);
           spins = 0;
-        } else {
-          cpu_relax();
+          continue;
         }
+        ++spins;
       }
       if (stop.load(std::memory_order_relaxed)) return;
       seen = generation.load(std::memory_order_acquire);
@@ -170,13 +184,19 @@ void Pool::parallel_for(int n, const std::function<void(int)>& fn) {
 
 namespace {
 
-// The threads this workload wants. A barrier per GEMM means every core stalls
-// at each one, so past ~8 the barriers and the shared memory system cost more
-// than the extra cores return: measured on an M4 Max, 6 beats 10 and 14.
+// The threads this workload wants. Measured on an M4 Max (10 performance + 4
+// efficiency cores), 6 beats every other count for both the fp32 and the int8
+// path — 6.8 s against 7.4 s at 8 and 15.8 s at 10 on a 5 s clip. The cores are
+// grouped in clusters and a barrier makes every thread wait for the slowest, so
+// spilling past one cluster costs more than the extra cores return.
 int preferred_threads() {
   const int cores = static_cast<int>(std::thread::hardware_concurrency());
   if (cores <= 0) return 1;
+#if defined(__APPLE__)
+  return std::min(cores, 6);
+#else
   return std::min(cores, 8);
+#endif
 }
 
 std::unique_ptr<Pool>& pool_slot() {

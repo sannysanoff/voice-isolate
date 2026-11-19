@@ -23,6 +23,7 @@ add_library(voiceisolate
   src/weights.cc
   src/pool.cc
   src/vecmath.cc
+  src/gemm_int8.cc
 )
 target_include_directories(voiceisolate
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${VI_THIRD_PARTY})

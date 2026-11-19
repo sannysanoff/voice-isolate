@@ -5,9 +5,11 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "common.h"
+#include "gemm_int8.h"
 #include "fft.h"
 
 namespace vi {
@@ -71,6 +73,11 @@ class Model {
   const std::vector<float>& window() const { return window_; }
   size_t weight_bytes() const { return weights_.bytes(); }
   size_t scratch_bytes() const;
+
+  // int8 weight-only dense layers. Off by default: the fp32 path is the
+  // reference-verified one, and the quantised path trades accuracy for speed.
+  void set_quant(bool on) { quant_enabled_ = on; }
+  bool quant_enabled() const { return quant_enabled_; }
 
   void init_lane(Lane& lane) const;
   // A lane's start: the recurrence carried, the attention past dropped.
@@ -158,19 +165,37 @@ class Model {
     // head's attention runs on contiguous rows instead of a 3*width stride.
     std::vector<float> bqkv;
     std::vector<float> mamba_ext, mamba_decay, mamba_h;
+    // Per-worker scratch for the int8 activations and their row scales.
+    std::vector<int8_t> q8;
+    std::vector<float> q8s;
   };
 
   Scratch& scratch(int rows) const;
-  // C[m, n] = A[m, k] * W[n, k]^T + bias, rows spread over the pool.
+  // C[m, n] = A[m, k] * W[n, k]^T + bias, columns spread over the pool.
   void linear_par(const float* a, int m, int k, const Tensor& w,
                   const float* bias, float* c) const;
+  // The int8 path; false when the layer is too small to be worth quantising.
+  bool linear_par_i8(const float* a, int m, int k, int stride, const Tensor& w,
+                     const float* bias, float* c) const;
+  const Int8Matrix* quantized(const Tensor& w) const;
+  mutable std::unordered_map<const Tensor*, Int8Matrix> quant_;
+  bool quant_enabled_ = false;
   void linear_par(const float* a, int m, int k, int stride, const Tensor& w,
                   const float* bias, float* c) const;
-  void elementwise_par(float* x, int n, void (*fn)(float*, int)) const;
+  // cost_per_element lets the caller say a kernel is expensive (erf, exp).
+  void elementwise_par(float* x, int n, void (*fn)(float*, int),
+                       int cost_per_element = 1) const;
   void layer_norm_par(const float* x, float* y, int rows, int cols,
                       const float* w, const float* b) const;
   void add_par(float* dst, const float* src, int n) const;
   void load_blocks();
+ public:
+  // Microbenchmark entry: the same GEMM the transformer runs.
+  void linear_par_bench(const float* a, int m, int k, const Tensor& w,
+                        const float* bias, float* c) const {
+    linear_par(a, m, k, w, bias, c);
+  }
+ private:
 
   void time_transformer(const AttnWeights& w, float* feat, int frames,
                         AttnState& state, const Rope& rope,

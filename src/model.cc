@@ -37,6 +37,18 @@ struct Timer {
 
 constexpr float kPi = 3.14159265358979323846f;
 
+// A pool round trip costs roughly 40-60 us at eight threads: two cache-line
+// handshakes on the submit counter. Splitting a pass smaller than a few million
+// operations therefore loses more than it gains, and the small LayerNorm and
+// residual passes are exactly that size (94k floats each).
+constexpr int64_t kMinParallelOps = 2'000'000;
+
+// Below this the int8 threshold arithmetic and the extra activation pass cost
+// more than the four-fold MAC rate saves; dt_proj and friends stay in fp32.
+constexpr int64_t kMinQuantOps = 16'000'000;
+
+inline bool worth_splitting(int64_t ops) { return ops >= kMinParallelOps; }
+
 // How many channel ranges to carve each task into: enough to fill the pool,
 // but not so fine that the fixed cost per unit dominates.
 int channel_split(int tasks, int inner) {
@@ -437,10 +449,52 @@ Model::Scratch& Model::scratch(int rows) const {
   return s;
 }
 
+const Int8Matrix* Model::quantized(const Tensor& w) const {
+  // Keyed by the weight pointer inside the loaded blob, which never moves.
+  auto it = quant_.find(&w);
+  if (it != quant_.end()) return &it->second;
+  Int8Matrix matrix;
+  quantize_rows(w.data, w.dim(0), w.dim(1), matrix);
+  return &quant_.emplace(&w, std::move(matrix)).first->second;
+}
+
+bool Model::linear_par_i8(const float* a, int m, int k, int stride,
+                          const Tensor& w, const float* bias, float* c) const {
+  if (!quant_enabled_) return false;
+  const int n = w.dim(0);
+  // sdot consumes 16 int8 per instruction and the kernel tiles four columns.
+  if (k % 16 != 0 || n % 4 != 0) return false;
+  if (2 * static_cast<int64_t>(m) * k * n < kMinQuantOps) return false;
+  const int threads = default_pool().size();
+  const int chunks = std::min(threads, std::max(1, n / 64));
+  const Int8Matrix* qw = quantized(w);
+  Scratch& sc = scratch(m);
+  const size_t need_q = static_cast<size_t>(chunks) * m * k;
+  if (sc.q8.size() < need_q) sc.q8.resize(need_q);
+  if (sc.q8s.size() < static_cast<size_t>(chunks) * m)
+    sc.q8s.resize(static_cast<size_t>(chunks) * m);
+  default_pool().parallel_for(chunks, [&](int index) {
+    const int j0 = static_cast<int>(static_cast<int64_t>(n) * index / chunks);
+    const int j1 =
+        static_cast<int>(static_cast<int64_t>(n) * (index + 1) / chunks);
+    if (j1 <= j0) return;
+    gemm_int8_columns(a, m, k, stride, *qw, bias, c, j0, j1,
+                      sc.q8.data() + static_cast<size_t>(index) * m * k,
+                      sc.q8s.data() + static_cast<size_t>(index) * m);
+  });
+  return true;
+}
+
 void Model::linear_par(const float* a, int m, int k, int stride, const Tensor& w,
                        const float* bias, float* c) const {
+  Timer timer(profile_enabled() ? &profile().gemm : nullptr);
+  if (linear_par_i8(a, m, k, stride, w, bias, c)) return;
   const int n = w.dim(0);
   const int threads = default_pool().size();
+  if (!worth_splitting(2 * static_cast<int64_t>(m) * k * n) || threads == 1) {
+    linear(a, m, k, stride, w, bias, c);
+    return;
+  }
   // Split the output columns: the tokens are few and shared, so splitting rows
   // would make every thread stream the whole weight matrix. Narrow layers
   // (x_proj and dt_proj have n = 64) cannot be split by columns, and there the
@@ -488,6 +542,11 @@ void Model::linear_par(const float* a, int m, int k, const Tensor& w,
 
 void Model::layer_norm_par(const float* x, float* y, int rows, int cols,
                            const float* w, const float* b) const {
+  Timer timer(profile_enabled() ? &profile().ln : nullptr);
+  if (!worth_splitting(3 * static_cast<int64_t>(rows) * cols)) {
+    layer_norm(x, y, rows, cols, w, b);
+    return;
+  }
   const int chunks = std::min(default_pool().size(), std::max(1, rows / 8));
   if (chunks <= 1) {
     layer_norm(x, y, rows, cols, w, b);
@@ -504,6 +563,11 @@ void Model::layer_norm_par(const float* x, float* y, int rows, int cols,
 }
 
 void Model::add_par(float* dst, const float* src, int n) const {
+  Timer timer(profile_enabled() ? &profile().add : nullptr);
+  if (!worth_splitting(n)) {
+    for (int i = 0; i < n; ++i) dst[i] += src[i];
+    return;
+  }
   const int chunks = std::min(default_pool().size(), std::max(1, n / 16384));
   if (chunks <= 1) {
     for (int i = 0; i < n; ++i) dst[i] += src[i];
@@ -517,7 +581,12 @@ void Model::add_par(float* dst, const float* src, int n) const {
   });
 }
 
-void Model::elementwise_par(float* x, int n, void (*fn)(float*, int)) const {
+void Model::elementwise_par(float* x, int n, void (*fn)(float*, int),
+                            int cost_per_element) const {
+  if (!worth_splitting(static_cast<int64_t>(n) * cost_per_element)) {
+    fn(x, n);
+    return;
+  }
   const int chunks = std::min(default_pool().size(), std::max(1, n / 4096));
   if (chunks <= 1) {
     fn(x, n);
@@ -656,6 +725,7 @@ void Model::time_transformer(const AttnWeights& w, float* feat, int frames,
              sc.qkv.data());
 
   const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+  const bool pf_single = profile_enabled() && default_pool().size() == 1;
   const int past_lo = std::max(0, first - lp.cache_frames);
   // Keys and values live head-major: [band][head][slot][hd]. A head then walks
   // its whole window as one contiguous run instead of touching one eighth of
@@ -700,12 +770,19 @@ void Model::time_transformer(const AttnWeights& w, float* feat, int frames,
         const float* keys =
             kbase + static_cast<size_t>(h) * lane_stride + first_slot;
         float* s = scores;
-        const float sum = scores_softmax(q, keys, n, hd, scale, s);
+        float sum;
+        {
+          Timer slot(pf_single ? &profile().attn_scores : nullptr);
+          sum = scores_softmax(q, keys, n, hd, scale, s);
+        }
         const float inv = 1.0f / sum;
         float* o = out + h * hd;
         const float* values =
             vbase + static_cast<size_t>(h) * lane_stride + first_slot;
-        pv_row(s, inv, values, n, hd, o);
+        {
+          Timer slot(pf_single ? &profile().attn_pv : nullptr);
+          pv_row(s, inv, values, n, hd, o);
+        }
         // Exclusive self attention: drop the component along the token's value.
         const float* v = row + 2 * width + h * hd;
         const float dot_v = dot(o, v, hd);
@@ -724,7 +801,7 @@ void Model::time_transformer(const AttnWeights& w, float* feat, int frames,
   layer_norm_par(feat, sc.norm.data(), rows, width, w.n2w->data, w.n2b->data);
   linear_par(sc.norm.data(), rows, width, *w.f0w, w.f0b->data,
              sc.ffn.data());
-  elementwise_par(sc.ffn.data(), rows * 4 * width, v_gelu);
+  elementwise_par(sc.ffn.data(), rows * 4 * width, v_gelu, /*cost=*/20);
   linear_par(sc.ffn.data(), rows, 4 * width, *w.f1w, w.f1b->data,
              sc.trans.data());
   add_par(feat, sc.trans.data(), rows * width);
@@ -784,6 +861,7 @@ void Model::band_transformer(const AttnWeights& w, float* feat,
   }
 
   const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+  const bool pf_single = profile_enabled() && default_pool().size() == 1;
   const float* qall = sc.bqkv.data();
   const float* kall = qall + per_unit * units;
   const float* vall = kall + per_unit * units;
@@ -797,11 +875,18 @@ void Model::band_transformer(const AttnWeights& w, float* feat,
     float* scores = sc.bscores.data() + static_cast<size_t>(unit) * bands * bands;
     for (int i = 0; i < bands; ++i) {
       float* s = scores + static_cast<size_t>(i) * bands;
-      const float sum = scores_softmax(q + static_cast<size_t>(i) * hd, k,
-                                       bands, hd, scale, s);
+      float sum;
+      {
+        Timer slot(pf_single ? &profile().attn_scores : nullptr);
+        sum = scores_softmax(q + static_cast<size_t>(i) * hd, k, bands, hd,
+                             scale, s);
+      }
       const float inv = 1.0f / sum;
       float* o = out + static_cast<size_t>(i) * width;
-      pv_row(s, inv, v, bands, hd, o);
+      {
+        Timer slot(pf_single ? &profile().attn_pv : nullptr);
+        pv_row(s, inv, v, bands, hd, o);
+      }
     }
   });
   // Exclusive self attention is off across bands for this checkpoint.
@@ -812,7 +897,7 @@ void Model::band_transformer(const AttnWeights& w, float* feat,
   layer_norm_par(sc.trans.data(), sc.norm.data(), rows, width, w.bn2w->data,
                  w.bn2b->data);
   linear_par(sc.norm.data(), rows, width, *w.bl1w, w.bl1b->data, sc.ffn.data());
-  elementwise_par(sc.ffn.data(), rows * 4 * width, v_gelu);
+  elementwise_par(sc.ffn.data(), rows * 4 * width, v_gelu, /*cost=*/20);
   linear_par(sc.ffn.data(), rows, 4 * width, *w.bl2w, w.bl2b->data,
              sc.norm.data());
   add_par(sc.trans.data(), sc.norm.data(), rows * width);
@@ -910,7 +995,7 @@ void Model::mamba_layer(const MambaLayer& l, const float* x, int rows, int len,
   linear_par(sc.u2.data(), rows, inner, *l.x_w, nullptr, sc.xp.data());
   linear_par(sc.xp.data(), rows, dt_rank, dt_total, *l.dt_w, l.dt_b->data,
              sc.delta.data());
-  elementwise_par(sc.delta.data(), rows * inner, v_softplus);
+  elementwise_par(sc.delta.data(), rows * inner, v_softplus, /*cost=*/10);
 
   {
     Timer slot(profile_enabled() ? &profile().mamba_scan : nullptr);

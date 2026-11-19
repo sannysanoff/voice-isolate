@@ -1,6 +1,8 @@
 // Vector math over arrays, on top of xsimd's portable SIMD kernels.
 #pragma once
 
+#include <cstdint>
+
 #include <xsimd/xsimd.hpp>
 
 namespace vi {
@@ -20,6 +22,15 @@ void v_scale(float* x, int n, float factor);
 
 // Sum of n contiguous elements.
 float v_sum(const float* x, int n);
+
+// Largest magnitude in n contiguous elements.
+float v_absmax(const float* x, int n);
+
+// Root mean square of n contiguous elements.
+float v_rms(const float* x, int n);
+
+// dst[i] = round(src[i] * inv_scale), saturated to [-127, 127].
+void v_quantize_i8(const float* src, int8_t* dst, int n, float inv_scale);
 
 // out[i] = exp(a[i] * scale[i]) over n contiguous elements.
 void v_mul_exp(float* out, const float* a, const float* scale, int n);

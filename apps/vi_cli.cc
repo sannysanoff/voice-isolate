@@ -24,6 +24,7 @@ void usage() {
       "  --cache-frames N     attention lookback (default: checkpoint)\n"
       "  --threads N          worker threads (default: all cores)\n"
       "  --float32            write float32 WAV instead of PCM16\n"
+      "  --quant int8         int8 weights for the dense layers (faster, lossy)\n"
       "  --filter             raw float32 mono on stdin, filter on stdout\n"
       "  --chunk N            filter mode: samples per read (default 480)\n"
       "  --quiet              no timing report\n"
@@ -38,6 +39,7 @@ int main(int argc, char** argv) {
   vi::StreamOptions options;
   int threads = 0;
   bool float32 = false;
+  bool quant = false;
   bool filter = false;
   bool quiet = false;
   int chunk = 480;
@@ -60,6 +62,8 @@ int main(int argc, char** argv) {
     else if (arg == "--threads") threads = std::stoi(next());
     else if (arg == "--chunk") chunk = std::stoi(next());
     else if (arg == "--float32") float32 = true;
+    else if (arg == "--quant")
+      quant = next() == "int8";
     else if (arg == "--filter") filter = true;
     else if (arg == "--quiet") quiet = true;
     else if (arg == "--profile") vi::Model::profile_enabled() = true;
@@ -74,14 +78,17 @@ int main(int argc, char** argv) {
 
   try {
     auto model = std::make_shared<vi::Model>(model_dir);
+    model->set_quant(quant);
     vi::Stream stream(model, options);
     if (!quiet)
       std::fprintf(stderr,
-                   "weights %.1f MB, threads %d, look-ahead %d frames, latency "
+                   "weights %.1f MB, threads %d, %s, look-ahead %d frames, latency "
                    "%d samples (%.1f ms), attention window %d frames, cache "
                    "%d frames\n",
                    static_cast<double>(model->weight_bytes()) / 1e6,
-                   vi::default_pool().size(), stream.lookahead_frames(),
+                   vi::default_pool().size(),
+                   quant ? "int8 weights" : "fp32 weights",
+                   stream.lookahead_frames(),
                    stream.latency_samples(),
                    1000.0 * stream.latency_samples() / stream.sample_rate(),
                    options.window_frames, stream.attention_capacity());
@@ -136,9 +143,14 @@ int main(int argc, char** argv) {
       if (vi::Model::profile_enabled())
         std::fprintf(stderr,
                      "  encode %.2f s  time_attn %.2f  band_attn %.2f  mamba %.2f"
-                     "  decode %.2f  (stages %.2f of %.2f s = %.0f%%)\n",
+                     "  decode %.2f  (stages %.2f of %.2f s = %.0f%%)\n"
+                     "    gemm %.2f  ln %.2f  scores %.2f  pv %.2f  rope %.2f"
+                     "  transpose %.2f  mconv %.2f  scan %.2f  add %.2f"
+                     "  corr %.2f  ola %.2f\n",
                      p.encode, p.time_attn, p.band_attn, p.mamba, p.decode,
-                     stage, seconds, 100.0 * stage / seconds);
+                     stage, seconds, 100.0 * stage / seconds, p.gemm, p.ln,
+                     p.attn_scores, p.attn_pv, p.rope, p.transpose, p.mamba_conv,
+                     p.mamba_scan, p.add, p.corr, p.ola);
       const double audio_seconds =
           static_cast<double>(audio.samples.size()) / audio.sample_rate;
       std::fprintf(stderr, "%s: %.2f s audio in %.2f s (%.2fx realtime)\n",

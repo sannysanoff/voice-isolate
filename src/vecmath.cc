@@ -1,5 +1,6 @@
 #include "vecmath.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace vi {
@@ -65,6 +66,46 @@ float v_sum(const float* x, int n) {
   float sum = xsimd::reduce_add(acc);
   for (; i < n; ++i) sum += x[i];
   return sum;
+}
+
+float v_absmax(const float* x, int n) {
+  vx::batch acc(0.0f);
+  int i = 0;
+  for (; i + vx::lanes <= n; i += vx::lanes)
+    acc = xsimd::max(acc, xsimd::abs(load(x + i)));
+  float peak = xsimd::reduce_max(acc);
+  for (; i < n; ++i) peak = std::max(peak, std::fabs(x[i]));
+  return peak;
+}
+
+float v_rms(const float* x, int n) {
+  vx::batch acc(0.0f);
+  int i = 0;
+  for (; i + vx::lanes <= n; i += vx::lanes) {
+    const vx::batch v = load(x + i);
+    acc += v * v;
+  }
+  float sum = xsimd::reduce_add(acc);
+  for (; i < n; ++i) sum += x[i] * x[i];
+  return std::sqrt(sum / static_cast<float>(n));
+}
+
+void v_quantize_i8(const float* src, int8_t* dst, int n, float inv_scale) {
+  const vx::batch scale(inv_scale);
+  const vx::batch lo(-127.0f), hi(127.0f);
+  int i = 0;
+  for (; i + vx::lanes <= n; i += vx::lanes) {
+    const vx::batch v = xsimd::min(xsimd::max(load(src + i) * scale, lo), hi);
+    const auto rounded = xsimd::round(v);
+    alignas(vx::lanes * 4) float lane[vx::lanes];
+    store(lane, rounded);
+    for (int t = 0; t < vx::lanes; ++t) dst[i + t] = static_cast<int8_t>(lane[t]);
+  }
+  for (; i < n; ++i) {
+    const float v = src[i] * inv_scale;
+    const int q = static_cast<int>(std::lround(v));
+    dst[i] = static_cast<int8_t>(std::min(127, std::max(-127, q)));
+  }
 }
 
 void v_mul_exp(float* out, const float* a, const float* scale, int n) {
