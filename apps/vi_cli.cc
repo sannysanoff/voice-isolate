@@ -23,6 +23,7 @@ void usage() {
       "  --crossfade-frames N crossfade before each boundary (default 200)\n"
       "  --cache-frames N     attention lookback (default: checkpoint)\n"
       "  --threads N          worker threads (default: all cores)\n"
+      "  --device=MODE        execution device: cpu (default) or metal\n"
       "  --float32            write float32 WAV instead of PCM16\n"
       "  --quant MODE         dense precision: fp32 (default), fp16, bf16, int8, int8g\n"
       "  --fp16-kv            store time-attention KV cache in fp16 (faster, half RAM)\n"
@@ -40,6 +41,7 @@ int main(int argc, char** argv) {
   vi::StreamOptions options;
   int threads = 0;
   bool float32 = false;
+  vi::Model::Device device = vi::Model::Device::Cpu;
   vi::Model::QuantMode quant_mode = vi::Model::QuantMode::Fp32;
   std::string quant_name = "fp32";
   bool fp16_kv = false;
@@ -47,6 +49,12 @@ int main(int argc, char** argv) {
   bool filter = false;
   bool quiet = false;
   int chunk = 480;
+
+  auto parse_device = [&](const std::string& val) -> bool {
+    if (val == "cpu") { device = vi::Model::Device::Cpu; return true; }
+    if (val == "metal") { device = vi::Model::Device::Metal; return true; }
+    return false;
+  };
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -64,6 +72,10 @@ int main(int argc, char** argv) {
       options.crossfade_frames = std::stoi(next());
     else if (arg == "--cache-frames") options.cache_frames = std::stoi(next());
     else if (arg == "--threads") threads = std::stoi(next());
+    else if (arg == "--device") { if (!parse_device(next())) { usage(); return 2; } }
+    else if (arg.rfind("--device=", 0) == 0) {
+      if (!parse_device(arg.substr(9))) { usage(); return 2; }
+    }
     else if (arg == "--chunk") chunk = std::stoi(next());
     else if (arg == "--float32") float32 = true;
     else if (arg == "--quant") {
@@ -90,26 +102,35 @@ int main(int argc, char** argv) {
 
   try {
     auto model = std::make_shared<vi::Model>(model_dir);
+    model->set_device(device);
     model->set_quant_mode(quant_mode);
     if (fp16_kv_explicit)
       model->set_fp16_kv(fp16_kv);
     else if (quant_mode != vi::Model::QuantMode::Fp32)
       model->set_fp16_kv(true);
     vi::Stream stream(model, options);
-    if (!quiet)
+    if (!quiet) {
+      const bool is_metal = (model->device() == vi::Model::Device::Metal);
+      const char* w_mode =
+          is_metal ? (quant_mode == vi::Model::QuantMode::Fp32 ? "fp32" : "fp16")
+                   : quant_name.c_str();
+      const char* w_accel =
+          is_metal ? " (MPS)" : (vi::sme2_available() ? " (SME2)" : "");
       std::fprintf(stderr,
-                   "weights %.1f MB, threads %d, %s weights%s%s, look-ahead %d frames, latency "
+                   "device %s, weights %.1f MB, threads %d, %s weights%s%s, look-ahead %d frames, latency "
                    "%d samples (%.1f ms), attention window %d frames, cache "
                    "%d frames\n",
+                   model->device_description().c_str(),
                    static_cast<double>(model->weight_bytes()) / 1e6,
                    vi::default_pool().size(),
-                   quant_name.c_str(),
-                   vi::sme2_available() ? " (SME2)" : "",
+                   w_mode,
+                   w_accel,
                    model->fp16_kv() ? " + fp16-kv" : "",
                    stream.lookahead_frames(),
                    stream.latency_samples(),
                    1000.0 * stream.latency_samples() / stream.sample_rate(),
                    options.window_frames, stream.attention_capacity());
+    }
 
     if (filter) {
       // A live source: hand over each chunk as it arrives, write what is final.

@@ -300,6 +300,14 @@ void Rope::init(int head_dim, int positions) {
 
 // ----------------------------------------------------------------- model ----
 
+#if !defined(VI_HAS_METAL)
+bool metal_available() { return false; }
+std::unique_ptr<MetalContext> MetalContext::create(
+    const Config&, const std::vector<MetalBlockDesc>&, bool, bool) {
+  throw std::runtime_error("Metal backend was not enabled in this build");
+}
+#endif
+
 Model::Model(const std::string& dir) : cfg_(load_config(dir)), fft_(cfg_.n_fft) {
   weights_.load(dir);
   window_.resize(static_cast<size_t>(cfg_.n_fft));
@@ -311,15 +319,91 @@ Model::Model(const std::string& dir) : cfg_(load_config(dir)), fft_(cfg_.n_fft) 
   prepack_weights();
 }
 
-void Model::set_quant_mode(QuantMode mode) {
-  quant_mode_ = mode;
-  prepack_weights();
+void Model::set_device(Device dev) {
+  if (dev == device_) return;
+  device_ = dev;
+  if (device_ == Device::Metal) {
+    if (!metal_) {
+      std::vector<MetalBlockDesc> descs;
+      descs.reserve(blocks_.size());
+      auto fill_mamba = [](const MambaLayer& l) {
+        MetalMambaLayerDesc d;
+        d.in_w = l.in_w->data;
+        d.conv_t = l.conv_t.data();
+        d.conv_b = l.conv_b->data;
+        d.x_w = l.x_w->data;
+        d.dt_w = l.dt_w->data;
+        d.dt_b = l.dt_b->data;
+        d.d = l.d->data;
+        d.a = l.a.data();
+        d.out_w = l.out_w->data;
+        return d;
+      };
+      for (const Block& b : blocks_) {
+        MetalBlockDesc d;
+        d.transformer = b.transformer;
+        if (b.transformer) {
+          const AttnWeights& a = b.attn;
+          d.n1w = a.n1w->data; d.n1b = a.n1b->data;
+          d.n2w = a.n2w->data; d.n2b = a.n2b->data;
+          d.qkv_w = a.qkv_w->data; d.qkv_b = a.qkv_b->data;
+          d.proj_w = a.proj_w->data; d.proj_b = a.proj_b->data;
+          d.f0w = a.f0w->data; d.f0b = a.f0b->data;
+          d.f1w = a.f1w->data; d.f1b = a.f1b->data;
+          d.bn1w = a.bn1w->data; d.bn1b = a.bn1b->data;
+          d.bn2w = a.bn2w->data; d.bn2b = a.bn2b->data;
+          d.in_w = a.in_w->data; d.in_b = a.in_b->data;
+          d.out_w = a.out_w->data; d.out_b = a.out_b->data;
+          d.bl1w = a.bl1w->data; d.bl1b = a.bl1b->data;
+          d.bl2w = a.bl2w->data; d.bl2b = a.bl2b->data;
+        } else {
+          d.time_fwd = fill_mamba(b.time_mamba.forward);
+          d.tm_out_w = b.time_mamba.out_w->data;
+          d.tm_out_b = b.time_mamba.out_b->data;
+          d.tm_norm_w = b.time_mamba.norm_w->data;
+          d.tm_norm_b = b.time_mamba.norm_b->data;
+          d.freq_fwd = fill_mamba(b.freq_mamba.forward);
+          d.freq_bwd = fill_mamba(b.freq_mamba.backward);
+          d.fm_out_w = b.freq_mamba.out_w->data;
+          d.fm_out_b = b.freq_mamba.out_b->data;
+          d.fm_norm_w = b.freq_mamba.norm_w->data;
+          d.fm_norm_b = b.freq_mamba.norm_b->data;
+        }
+        descs.push_back(d);
+      }
+      const bool use_f16 = (quant_mode_ != QuantMode::Fp32);
+      metal_ = MetalContext::create(cfg_, descs, use_f16, fp16_kv_);
+    }
+  } else {
+    prepack_weights();
+  }
 }
 
-void Model::set_fp16_kv(bool on) { fp16_kv_ = on && fp16_neon_available(); }
+std::string Model::device_description() const {
+  if (device_ == Device::Metal && metal_) {
+    return "metal (" + metal_->device_name() + ")";
+  }
+  return "cpu";
+}
+
+void Model::set_quant_mode(QuantMode mode) {
+  quant_mode_ = mode;
+  if (device_ == Device::Metal && metal_) {
+    metal_->set_precision(quant_mode_ != QuantMode::Fp32, fp16_kv_);
+  } else {
+    prepack_weights();
+  }
+}
+
+void Model::set_fp16_kv(bool on) {
+  fp16_kv_ = on && (device_ == Device::Metal || fp16_neon_available());
+  if (device_ == Device::Metal && metal_) {
+    metal_->set_precision(quant_mode_ != QuantMode::Fp32, fp16_kv_);
+  }
+}
 
 void Model::prepack_weights() const {
-  if (!sme2_available()) return;
+  if (device_ == Device::Metal || !sme2_available()) return;
   std::vector<const Tensor*> list;
   list.reserve(blocks_.size() * 14);
   for (const Block& b : blocks_) {
@@ -925,6 +1009,11 @@ size_t Model::scratch_bytes() const {
 }
 
 void Model::init_lane(Lane& lane) const {
+  if (device_ == Device::Metal && metal_) {
+    lane.metal = metal_->init_lane();
+    lane.started = true;
+    return;
+  }
   lane.attn.assign(static_cast<size_t>(cfg_.num_blocks), AttnState());
   lane.mamba.assign(static_cast<size_t>(cfg_.num_blocks), MambaState());
   const size_t conv = static_cast<size_t>(cfg_.bands()) * cfg_.inner() *
@@ -941,6 +1030,11 @@ void Model::init_lane(Lane& lane) const {
 }
 
 void Model::clone_lane(const Lane& src, Lane& dst) const {
+  if (device_ == Device::Metal && metal_) {
+    dst.metal = metal_->clone_lane(src.metal);
+    dst.started = true;
+    return;
+  }
   dst.attn.resize(src.attn.size());
   for (auto& state : dst.attn) state.release();
   dst.mamba = src.mamba;  // the recurrence carries over
@@ -1876,6 +1970,10 @@ void Model::mamba_layer_pair(const MambaLayer& l, const float* x, int rows_each,
 
 void Model::backbone(float* feat, int frames, Lane& lane, const Rope& rope,
                      const LaneParams& lp) const {
+  if (device_ == Device::Metal && metal_) {
+    metal_->backbone(feat, frames, lane.metal, rope, lp, debug_block);
+    return;
+  }
   const int bands = cfg_.bands();
   const int width = cfg_.width;
   const int inner = cfg_.inner();
@@ -1971,6 +2069,11 @@ void Model::backbone_pair(float* feat_a, float* feat_b, int frames,
   if (debug_block) {
     backbone(feat_a, frames, lane_a, rope, lp);
     backbone(feat_b, frames, lane_b, rope, lp);
+    return;
+  }
+  if (device_ == Device::Metal && metal_) {
+    metal_->backbone_pair(feat_a, feat_b, frames, lane_a.metal, lane_b.metal,
+                          rope, lp);
     return;
   }
   const int bands = cfg_.bands();

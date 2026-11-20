@@ -12,6 +12,7 @@
 #include "gemm_int8.h"
 #include "gemm_sme.h"
 #include "fft.h"
+#include "metal_backend.h"
 
 namespace vi {
 
@@ -58,6 +59,7 @@ struct MambaState {
 struct Lane {
   std::vector<AttnState> attn;    // indexed by block
   std::vector<MambaState> mamba;  // indexed by block
+  std::shared_ptr<MetalLaneState> metal;
   bool started = false;
 };
 
@@ -78,6 +80,11 @@ class Model {
   size_t weight_bytes() const { return weights_.bytes(); }
   size_t scratch_bytes() const;
 
+  enum class Device {
+    Cpu = 0,
+    Metal = 1,
+  };
+
   enum class QuantMode {
     Fp32 = 0,
     Fp16 = 1,
@@ -85,6 +92,11 @@ class Model {
     Int8 = 3,
     Int8Group = 4,
   };
+
+  // Execution device. Cpu is the default; Metal offloads the backbone to GPU.
+  void set_device(Device dev);
+  Device device() const { return device_; }
+  std::string device_description() const;
 
   // Precision mode for dense layers. Fp32 is the reference-verified default.
   void set_quant(bool on) {
@@ -226,6 +238,8 @@ class Model {
   mutable std::unordered_map<const Tensor*, PackedI8Group> sme_i8g_;
   QuantMode quant_mode_ = QuantMode::Fp32;
   bool fp16_kv_ = false;
+  Device device_ = Device::Cpu;
+  mutable std::unique_ptr<MetalContext> metal_;
   void linear_par(const float* a, int m, int k, int stride, const Tensor& w,
                   const float* bias, float* c) const;
   // cost_per_element lets the caller say a kernel is expensive (erf, exp).

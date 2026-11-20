@@ -11,6 +11,11 @@ endif()
 option(VI_NATIVE "Tune for the build machine (-march=native). Desktop only" ON)
 option(VI_WARNINGS "Enable warnings" ON)
 option(VI_SME2 "Enable ARM SME2 matrix kernels when supported by compiler" ON)
+option(VI_METAL "Enable Apple Metal GPU backend on macOS" ON)
+
+if(APPLE AND VI_METAL)
+  enable_language(OBJCXX)
+endif()
 
 include(CheckCXXSourceCompiles)
 
@@ -71,6 +76,20 @@ if(VI_SME2 AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
 endif()
 find_package(Threads REQUIRED)
 target_link_libraries(voiceisolate PUBLIC Threads::Threads)
+
+if(APPLE AND VI_METAL)
+  target_sources(voiceisolate PRIVATE src/metal_backend.mm)
+  set_source_files_properties(src/metal_backend.mm PROPERTIES
+    COMPILE_OPTIONS "-fobjc-arc"
+  )
+  target_compile_definitions(voiceisolate PUBLIC VI_HAS_METAL=1)
+  target_link_libraries(voiceisolate PUBLIC
+    "-framework Metal"
+    "-framework MetalPerformanceShaders"
+    "-framework Foundation"
+  )
+  message(STATUS "Apple Metal GPU backend enabled")
+endif()
 
 if(VI_WARNINGS)
   target_compile_options(voiceisolate PRIVATE -Wall -Wextra -Wno-unused-parameter)
