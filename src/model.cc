@@ -859,10 +859,49 @@ bool Model::linear_par_sme(const float* a, int m, int k, int stride,
   return true;
 }
 
+void Model::linear_par_avx2(const float* a, int m, int k, int stride,
+                            const Tensor& w, const float* bias, float* c) const {
+  const int n = w.dim(0);
+  auto it = avx2_weights_.find(&w);
+  if (it == avx2_weights_.end()) {
+    Avx2Weights packed;
+    pack_avx2_weights(w.data, n, k, packed);
+    it = avx2_weights_.emplace(&w, std::move(packed)).first;
+  }
+  Scratch& sc = scratch(m);
+  const size_t bytes = static_cast<size_t>(m) * k;
+  if (sc.q8.size() < bytes) sc.q8.resize(bytes);
+  if (sc.q8s.size() < static_cast<size_t>(m)) sc.q8s.resize(m);
+  auto* aq = reinterpret_cast<uint8_t*>(sc.q8.data());
+  const int threads = default_pool().size();
+  // Give each worker whole four-row tiles and private activation scratch.
+  const int tiles = (m - 1) / 4 + 1;
+  const int chunks = std::min(threads, tiles);
+  const auto boundary = [&](int chunk) {
+    const int64_t tile = static_cast<int64_t>(tiles) * chunk / chunks;
+    return static_cast<int>(std::min<int64_t>(m, 4 * tile));
+  };
+  default_pool().parallel_for(chunks, [&](int index) {
+    const int r0 = boundary(index), r1 = boundary(index + 1);
+    auto* row_data = aq + static_cast<size_t>(r0) * k;
+    auto* scales = sc.q8s.data() + r0;
+    quantize_avx2_rows(a + static_cast<size_t>(r0) * stride, r1 - r0, k, stride,
+                       row_data, scales);
+    gemm_avx2_tiles(row_data, scales, r1 - r0, it->second, bias,
+                    c + static_cast<size_t>(r0) * n, 0, n / 16);
+  });
+}
+
 bool Model::linear_par_i8(const float* a, int m, int k, int stride,
                           const Tensor& w, const float* bias, float* c) const {
-  if (quant_mode_ != QuantMode::Int8 || !int8_available()) return false;
+  if (quant_mode_ != QuantMode::Int8) return false;
   const int n = w.dim(0);
+  if (avx2_int8_available() && k % 4 == 0 && k <= 65536 && n % 16 == 0 &&
+      2 * static_cast<int64_t>(m) * k * n >= kMinQuantOps) {
+    linear_par_avx2(a, m, k, stride, w, bias, c);
+    return true;
+  }
+  if (!int8_available()) return false;
   // sdot consumes 16 int8 per instruction and the kernel tiles four columns.
   if (k % 16 != 0 || n % 4 != 0) return false;
   if (2 * static_cast<int64_t>(m) * k * n < kMinQuantOps) return false;

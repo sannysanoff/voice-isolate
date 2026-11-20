@@ -614,3 +614,44 @@ The realtime goal remains unmet on this machine. GEMM is the largest measured
 cost; further work should benchmark better packed/vectorized x86 kernels and
 threading against the full recording, while checking the quality impact of any
 lower-precision mode. See `README-intel.md` for build and CLI commands.
+
+## Ryzen AVX2 int8 follow-up
+
+Starting revision `3e49c57`, Ryzen 9 3900X, 12 visible cores, GCC 12.3,
+Release `-O3 -march=native -fno-math-errno`. The timed builds used Eigen
+3.4.0, xsimd 13.2.0 and the same optional OpenBLAS 0.3.15 as the handoff.
+All runs used four-frame blocks, a 600-frame window and a 200-frame crossfade.
+
+The AVX2 dense kernel packs 16 columns by four depth values in each aligned
+64-byte panel. A 4-by-16 register tile shares its weights across four rows.
+Weights are cached on first use. Each worker quantizes disjoint activation rows
+once and corrects the unsigned activation offset in the integer accumulator.
+A per-output weight scale bounds same-sign byte pairs so the int16 intermediate
+cannot saturate. Eight-wide AVX2/FMA scan, SIMD attention scores, depthwise
+convolution and the four-row decoder also use the existing fp32 model layout.
+
+| Full recording, 8 threads, one run each | CLI processing (s) | User CPU (s) | GEMM (s) | Scan (s) |
+|---|---:|---:|---:|---:|
+| Starting revision, fp32 | 113.31 | 859.65 | 59.99 | 12.53 |
+| First packed int8 build with vector scan and attention scores | 116.33 | 883.49 | 61.71 | 6.33 |
+
+The int8 run produced 2,125,746 samples. Against the same-source fp32 PCM16
+output it measured 19.67 dB SNR and 0.12793 peak absolute error (full scale
+1). SNR ranged from 11.49 to 27.45 dB across six-second windows including
+the final partial window. Sorting 100 ms segments by fp32 RMS, the quietest
+quartile had -54.02 dBFS RMS error and the loudest had -44.93 dBFS. The CLI
+peak-normalized both files. The fp32 baseline measured 69.71 dB against the
+supplied PCM16 reference.
+
+In the first five-second experiment with packed GEMM and the original scan,
+4/6/8 threads took 14.59/11.92/9.50 s of processing respectively. A later
+column-split version with a separate parallel quantization pass took 9.26
+and 9.87 s at eight threads. The retained row split needs one dispatch per
+dense layer. Small matrix tests of inline assembly and alternate row tile
+sizes gave inconsistent rankings across runs, so the kernel uses intrinsics.
+
+Subsequent sustained runs hit severe host throttling. Linux k10temp reported
+95.2°C with all reported core clocks below 1 GHz, reaching 103.5°C after the
+benchmarks stopped. The later trials cannot establish a sustained speedup.
+The full int8 quality and timing above precede the final decoder/convolution
+and attention-value loop changes. The Python reference fixtures were absent.

@@ -37,6 +37,7 @@ add_library(voiceisolate
   src/pool.cc
   src/vecmath.cc
   src/gemm_int8.cc
+  src/gemm_avx2.cc
   src/gemm_sme.cc
 )
 target_include_directories(voiceisolate

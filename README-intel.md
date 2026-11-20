@@ -30,3 +30,17 @@ mono. The model directory defaults to `model` relative to the current directory.
 an x86-64 binary intended for other machines. Run
 `ctest --test-dir build-intel --output-on-failure` for available tests; reference
 tests are skipped when the optional `ref/` data is absent.
+
+For quantized inference on x86-64, select the AVX2 backend with the existing
+int8 option. The CLI prints `int8 weights (AVX2)` when it detects support.
+
+```sh
+./build-intel/voice-isolate-cli input.wav output-int8.wav --quant int8 --threads 8 --profile
+```
+
+The model packs eligible dense weights on first use into 64-byte panels.
+Each worker quantizes its own activation rows once and computes 16 output
+channels per tile. Weight scaling bounds adjacent pairs to prevent saturation
+in the AVX2 byte multiply-add. Small or incompatible layers use fp32. The
+Mamba scan separately checks for both AVX2 and FMA. A `VI_NATIVE=OFF` build
+includes both runtime dispatches and runs the fallback paths on older CPUs.

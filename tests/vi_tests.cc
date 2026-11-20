@@ -1,4 +1,5 @@
 // Numerical and reference tests for the portable voice isolator.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -67,9 +68,97 @@ void expect(bool condition, const char* what) {
 
 // ------------------------------------------------------------------ tests ---
 
+void test_avx2_int8() {
+  if (!vi::avx2_int8_available()) {
+    std::printf("AVX2 int8 test skipped on this CPU\n");
+    return;
+  }
+  constexpr int m = 7, n = 48, k = 20, stride = 29;
+  std::vector<float> a(m * stride, 12345.f), w(n * k), bias(n);
+  for (int i = 0; i < m; ++i) {
+    for (int t = 0; t < k; ++t) {
+      a[i * stride + t] = i == 0 ? 0.f : i == 1 ? 127.f : i == 2 ? -127.f
+                                  : static_cast<float>((t * 29 + i * 47) % 255 - 127);
+    }
+  }
+  for (int j = 0; j < n; ++j) {
+    bias[j] = 0.1f * j;
+    for (int t = 0; t < k; ++t) {
+      // Include maximum same-sign pairs and opposing extrema.
+      w[j*k+t] = j % 4 == 0 ? 0.f : j % 4 == 1 ? 127.f :
+                 j % 4 == 2 ? (t % 2 ? -127.f : 127.f) :
+                              static_cast<float>((t * 31 + j * 19) % 255 - 127);
+    }
+  }
+  vi::Avx2Weights packed;
+  vi::pack_avx2_weights(w.data(), n, k, packed);
+  std::vector<uint8_t> q(m*k);
+  std::vector<float> scales(m), out(m*n), expected(m*n);
+  vi::quantize_avx2_rows(a.data(), m, k, stride, q.data(), scales.data());
+  for (bool use_bias : {false, true}) {
+    std::fill(out.begin(), out.end(), -12345.f);
+    expected = out;
+    vi::gemm_avx2_tiles(q.data(), scales.data(), m, packed,
+                        use_bias ? bias.data() : nullptr, out.data(), 1, 3);
+    for (int i = 0; i < m; ++i) {
+      float peak = 0.f;
+      for (int t = 0; t < k; ++t) peak = std::max(peak, std::abs(a[i*stride+t]));
+      const float as = peak ? peak / 127.f : 1.f;
+      for (int j = 16; j < n; ++j) {
+        float range = 0.f;
+        for (int t = 0; t < k; t += 2) {
+          float x = w[j*k+t], y = w[j*k+t+1];
+          range = std::max({range, std::abs(x), std::abs(y), std::abs(x+y)});
+        }
+        const float ws = range ? range / 127.f : 1.f;
+        int sum = 0;
+        for (int t = 0; t < k; ++t)
+          sum += static_cast<int>(std::nearbyint(a[i*stride+t] * (1.f/as))) *
+                 static_cast<int>(std::round(w[j*k+t] / ws));
+        expected[i*n+j] = sum * as * ws + (use_bias ? bias[j] : 0.f);
+      }
+    }
+    bool ok = true;
+    for (size_t i = 0; i < out.size(); ++i)
+      ok &= std::abs(out[i] - expected[i]) <= 1e-6f * std::max(1.f, std::abs(expected[i]));
+    expect(ok, use_bias ? "AVX2 int8 strided rows, tile slice, bias" :
+                          "AVX2 int8 strided rows, tile slice, no bias");
+  }
+}
+
+void test_attention_tiles() {
+  constexpr int n = 69;
+  for (int hd : {19, 64}) {
+    std::vector<float> q(4 * hd), kv(n * hd), scores(4 * n), out(4 * hd);
+    for (size_t i = 0; i < q.size(); ++i) q[i] = 0.1f * (int(i % 11) - 5);
+    for (size_t i = 0; i < kv.size(); ++i) kv[i] = 0.07f * (int(i % 17) - 8);
+    vi::v_attn4_qk(q.data(), q.data()+hd, q.data()+2*hd, q.data()+3*hd,
+                   kv.data(), n, hd, 0.25f, scores.data(), scores.data()+n,
+                   scores.data()+2*n, scores.data()+3*n);
+    vi::v_attn4_pv(scores.data(), scores.data()+n, scores.data()+2*n,
+                   scores.data()+3*n, kv.data(), n, hd, out.data(), out.data()+hd,
+                   out.data()+2*hd, out.data()+3*hd);
+    bool ok = true;
+    for (int r = 0; r < 4; ++r) {
+      for (int j = 0; j < n; ++j) {
+        double dot = 0;
+        for (int d = 0; d < hd; ++d) dot += double(q[r*hd+d]) * kv[j*hd+d];
+        ok &= std::abs(0.25 * dot - scores[r*n+j]) < 1e-5;
+      }
+      for (int d = 0; d < hd; ++d) {
+        double sum = 0;
+        for (int j = 0; j < n; ++j) sum += double(scores[r*n+j]) * kv[j*hd+d];
+        ok &= std::abs(sum - out[r*hd+d]) < 1e-5;
+      }
+    }
+    expect(ok, hd == 64 ? "four-query attention across key tiles" :
+                          "four-query attention with channel tail");
+  }
+}
+
 void test_scan() {
   std::printf("selective scan\n");
-  constexpr int inner = 12, state = 16, len = 7, rank = 3, total = rank + 2 * state;
+  constexpr int inner = 16, state = 16, len = 7, rank = 3, total = rank + 2 * state;
   std::vector<float> a(inner * state), h(inner * state), initial, u(len * inner),
       delta(len * inner), z(len * 2 * inner), xp(len * total), d(inner), out(len * inner);
   for (size_t i = 0; i < a.size(); ++i) { a[i] = -0.01f * (1 + i % 17); h[i] = 0.01f * (int(i % 11) - 5); }
@@ -343,6 +432,8 @@ int main(int argc, char** argv) {
   const std::string root = argc > 1 ? argv[1] : ".";
   test_fft();
   test_scan();
+  test_avx2_int8();
+  test_attention_tiles();
   test_vector_math();
   const bool quick = argc > 2 && std::string(argv[2]) == "quick";
   test_reference(root);

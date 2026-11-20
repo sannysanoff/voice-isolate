@@ -10,6 +10,7 @@
 
 #include "common.h"
 #include "gemm_int8.h"
+#include "gemm_avx2.h"
 #include "gemm_sme.h"
 #include "fft.h"
 #include "metal_backend.h"
@@ -221,7 +222,9 @@ class Model {
   // The SME2 path (handles fp32, fp16, bf16, int8, int8g when SME2 is available).
   bool linear_par_sme(const float* a, int m, int k, int stride, const Tensor& w,
                       const float* bias, float* c) const;
-  // The NEON int8 path; false when the layer is too small or SME2 handled it.
+  void linear_par_avx2(const float* a, int m, int k, int stride, const Tensor& w,
+                       const float* bias, float* c) const;
+  // CPU int8 dispatch after SME2 has declined the operation.
   bool linear_par_i8(const float* a, int m, int k, int stride, const Tensor& w,
                      const float* bias, float* c) const;
   const Int8Matrix* quantized(const Tensor& w) const;
@@ -231,6 +234,7 @@ class Model {
   const PackedI8* packed_i8(const Tensor& w) const;
   const PackedI8Group* packed_i8g(const Tensor& w) const;
   mutable std::unordered_map<const Tensor*, Int8Matrix> quant_;
+  mutable std::unordered_map<const Tensor*, Avx2Weights> avx2_weights_;
   mutable std::unordered_map<const Tensor*, PackedF32> sme_f32_;
   mutable std::unordered_map<const Tensor*, PackedF16> sme_f16_;
   mutable std::unordered_map<const Tensor*, PackedBF16> sme_bf16_;

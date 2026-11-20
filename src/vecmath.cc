@@ -4,6 +4,11 @@
 #include <cmath>
 #include <vector>
 
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#define VI_SCAN_AVX2 __attribute__((target("avx2,fma")))
+#endif
+
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
 #define VI_HAS_NEON 1
@@ -329,6 +334,70 @@ void v_scan_step(float* h, const float* a, const float* delta,
   }
 }
 
+#ifdef VI_SCAN_AVX2
+namespace {
+// 2^x on the nonpositive scan domain, using the same range reduction
+// and polynomial as the NEON scan. Below -150 the fp32 result rounds to 0.
+VI_SCAN_AVX2 inline __m256 exp2_negative(__m256 x) {
+  x = _mm256_max_ps(x, _mm256_set1_ps(-150.f));
+  const __m256 n = _mm256_round_ps(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+  const __m256 f = _mm256_sub_ps(x, n);
+  __m256 p = _mm256_set1_ps(1.546973199e-4f);
+  for (float coeff : {1.340043216e-3f, 9.618025603e-3f, 5.550327214e-2f,
+                      2.402265121e-1f, 6.931471806e-1f, 1.0f})
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(coeff));
+  // Split off 2^-64 so the exponent bit construction stays in the normal
+  // range even for subnormal results.
+  const __m256i bits = _mm256_slli_epi32(
+      _mm256_add_epi32(_mm256_cvttps_epi32(n), _mm256_set1_epi32(127 + 64)), 23);
+  return _mm256_mul_ps(_mm256_mul_ps(p, _mm256_castsi256_ps(bits)),
+                       _mm256_set1_ps(0x1p-64f));
+}
+
+VI_SCAN_AVX2 inline __m256 load_group_pair(const float* p) {
+  return _mm256_set_m128(_mm_loadu_ps(p + 16 * 4), _mm_loadu_ps(p));
+}
+
+VI_SCAN_AVX2 void scan8(float* h, const float* a, const float* skip,
+                        const float* u, const float* delta, const float* z,
+                        const float* xp, float* y, int len, int inner,
+                        int rank, int total, int c0, int c1) {
+  for (int c = c0; c < c1; c += 8) {
+    const size_t off = static_cast<size_t>(c / 4) * 16 * 4;
+    __m256 hv[16], av[16];
+    for (int s = 0; s < 16; ++s) {
+      hv[s] = h ? load_group_pair(h + off + 4 * s) : _mm256_setzero_ps();
+      av[s] = load_group_pair(a + off + 4 * s);
+    }
+    for (int t = 0; t < len; ++t) {
+      const size_t pos = static_cast<size_t>(t) * inner + c;
+      const auto vu = _mm256_loadu_ps(u + pos), vd = _mm256_loadu_ps(delta + pos);
+      const auto du = _mm256_mul_ps(vu, vd);
+      auto acc = _mm256_mul_ps(vu, _mm256_loadu_ps(skip + c));
+      const float* b = xp + static_cast<size_t>(t) * total + rank;
+      for (int s = 0; s < 16; ++s) {
+        const auto decay = exp2_negative(_mm256_mul_ps(av[s], vd));
+        hv[s] = _mm256_fmadd_ps(du, _mm256_set1_ps(b[s]), _mm256_mul_ps(decay, hv[s]));
+        acc = _mm256_fmadd_ps(hv[s], _mm256_set1_ps(b[s + 16]), acc);
+      }
+      const auto vz = _mm256_loadu_ps(z + static_cast<size_t>(t) * 2 * inner + inner + c);
+      const auto neg_abs = _mm256_or_ps(vz, _mm256_set1_ps(-0.f));
+      const auto e = exp2_negative(_mm256_mul_ps(neg_abs, _mm256_set1_ps(1.44269504f)));
+      const auto one = _mm256_set1_ps(1.f);
+      const auto gate = _mm256_div_ps(_mm256_blendv_ps(one, e, vz), _mm256_add_ps(one, e));
+      _mm256_storeu_ps(y + pos, _mm256_mul_ps(acc, _mm256_mul_ps(vz, gate)));
+    }
+    if (h) {
+      for (int s = 0; s < 16; ++s) {
+        _mm_storeu_ps(h + off + 4 * s, _mm256_castps256_ps128(hv[s]));
+        _mm_storeu_ps(h + off + 16 * 4 + 4 * s, _mm256_extractf128_ps(hv[s], 1));
+      }
+    }
+  }
+}
+}  // namespace
+#endif
+
 void v_mamba_scan(float* __restrict h4, const float* __restrict a_log2e4,
                   const float* __restrict d_skip, const float* __restrict u,
                   const float* __restrict delta, const float* __restrict z,
@@ -457,6 +526,16 @@ void v_mamba_scan(float* __restrict h4, const float* __restrict a_log2e4,
       }
     }
     return;
+  }
+#endif
+#ifdef VI_SCAN_AVX2
+  static const bool avx2_fma = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+  if (avx2_fma && state == 16 && c0 % 4 == 0) {
+    const int end = c0 + (c1 - c0) / 8 * 8;
+    scan8(h4, a_log2e4, d_skip, u, delta, z, xp, y, len, inner,
+          dt_rank, dt_total, c0, end);
+    if (end == c1) return;
+    c0 = end;
   }
 #endif
 #if defined(__SSE2__) && !VI_HAS_NEON
@@ -712,7 +791,13 @@ void v_conv4_silu(float* __restrict dst, const float* __restrict bias,
     dst[i] = silu_scalar(a);
   }
 #else
-  for (int i = 0; i < n; ++i) {
+  int i = 0;
+  for (; i + vx::lanes <= n; i += vx::lanes) {
+    auto v = load(bias + i) + load(w0 + i) * load(x0 + i) + load(w1 + i) * load(x1 + i)
+             + load(w2 + i) * load(x2 + i) + load(w3 + i) * load(x3 + i);
+    store(dst + i, v / (vx::batch(1.f) + xsimd::exp(-v)));
+  }
+  for (; i < n; ++i) {
     float a = bias[i] + w0[i] * x0[i] + w1[i] * x1[i] + w2[i] * x2[i] +
               w3[i] * x3[i];
     dst[i] = silu_scalar(a);
@@ -901,8 +986,18 @@ void v_attn4_qk(const float* __restrict q0, const float* __restrict q1,
 #else
   for (int j = 0; j < n; ++j) {
     const float* kj = keys + static_cast<size_t>(j) * hd;
-    float r0 = 0, r1 = 0, r2 = 0, r3 = 0;
-    for (int d = 0; d < hd; ++d) {
+    vx::batch a0(0.f), a1(0.f), a2(0.f), a3(0.f);
+    int d = 0;
+    for (; d + vx::lanes <= hd; d += vx::lanes) {
+      const auto key = load(kj + d);
+      a0 += load(q0 + d) * key;
+      a1 += load(q1 + d) * key;
+      a2 += load(q2 + d) * key;
+      a3 += load(q3 + d) * key;
+    }
+    float r0 = xsimd::reduce_add(a0), r1 = xsimd::reduce_add(a1);
+    float r2 = xsimd::reduce_add(a2), r3 = xsimd::reduce_add(a3);
+    for (; d < hd; ++d) {
       r0 += q0[d] * kj[d]; r1 += q1[d] * kj[d];
       r2 += q2[d] * kj[d]; r3 += q3[d] * kj[d];
     }
@@ -1008,6 +1103,37 @@ void v_attn4_pv(const float* __restrict p0, const float* __restrict p1,
     }
     return;
   }
+#else
+  // Keep two vectors per query in registers. Limit the key span so adjacent
+  // channel tiles reuse the same value rows from L1 on a 64-channel head.
+  if (hd % (2 * vx::lanes) == 0 && n > 0) {
+    for (int j0 = 0; j0 < n; j0 += 64) {
+      const int end = std::min(j0 + 64, n);
+      for (int d = 0; d < hd; d += 2 * vx::lanes) {
+        float* outs[] = {o0 + d, o1 + d, o2 + d, o3 + d};
+        const float* probs[] = {p0, p1, p2, p3};
+        vx::batch lo[4], hi[4];
+        for (int r = 0; r < 4; ++r) {
+          lo[r] = j0 ? load(outs[r]) : vx::batch(0.f);
+          hi[r] = j0 ? load(outs[r] + vx::lanes) : vx::batch(0.f);
+        }
+        for (int j = j0; j < end; ++j) {
+          const float* ptr = values + static_cast<size_t>(j) * hd + d;
+          const auto v0 = load(ptr), v1 = load(ptr + vx::lanes);
+          for (int r = 0; r < 4; ++r) {
+            const vx::batch prob(probs[r][j]);
+            lo[r] += v0 * prob;
+            hi[r] += v1 * prob;
+          }
+        }
+        for (int r = 0; r < 4; ++r) {
+          store(outs[r], lo[r]);
+          store(outs[r] + vx::lanes, hi[r]);
+        }
+      }
+    }
+    return;
+  }
 #endif
   for (int d = 0; d < hd; ++d) { o0[d] = o1[d] = o2[d] = o3[d] = 0.0f; }
   for (int j = 0; j < n; ++j) {
@@ -1093,14 +1219,12 @@ void v_linear_4rows(const float* __restrict a, int k, const float* __restrict w,
     c0[j] = r0; c1[j] = r1; c2[j] = r2; c3[j] = r3;
   }
 #else
-  for (int j = 0; j < n; ++j) {
-    const float* wj = w + static_cast<size_t>(j) * k;
-    const float b = bias ? bias[j] : 0.0f;
-    float r0 = b, r1 = b, r2 = b, r3 = b;
-    for (int d = 0; d < k; ++d) {
-      r0 += a0[d]*wj[d]; r1 += a1[d]*wj[d]; r2 += a2[d]*wj[d]; r3 += a3[d]*wj[d];
+  v_attn4_qk(a0, a1, a2, a3, w, n, k, 1.f, c0, c1, c2, c3);
+  if (bias) {
+    for (int j = 0; j < n; ++j) {
+      c0[j] += bias[j]; c1[j] += bias[j];
+      c2[j] += bias[j]; c3[j] += bias[j];
     }
-    c0[j] = r0; c1[j] = r1; c2[j] = r2; c3[j] = r3;
   }
 #endif
 }

@@ -23,8 +23,8 @@ struct Int8Matrix {
   int k = 0;
 };
 
-// True when the build has a vectorised int8 dot product. Without one the int8
-// path is a scalar fallback and is slower than fp32, so callers skip it.
+// Reports SDOT support for gemm_int8_columns. The separately packed x86
+// kernel has its own availability check in gemm_avx2.h.
 bool int8_available();
 
 // Quantises an [n][k] row-major matrix, one symmetric scale per row.

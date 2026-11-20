@@ -116,6 +116,10 @@ int main(int argc, char** argv) {
                    : quant_name.c_str();
       const char* w_accel =
           is_metal ? " (MPS)" : (vi::sme2_available() ? " (SME2)" : "");
+      if (!is_metal && !vi::sme2_available() && quant_mode == vi::Model::QuantMode::Int8) {
+        if (vi::avx2_int8_available()) w_accel = " (AVX2)";
+        else if (!vi::int8_available()) w_mode = "fp32 fallback";
+      }
       std::fprintf(stderr,
                    "device %s, weights %.1f MB, threads %d, %s weights%s%s, look-ahead %d frames, latency "
                    "%d samples (%.1f ms), attention window %d frames, cache "
