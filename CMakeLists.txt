@@ -101,6 +101,24 @@ if(VI_WARNINGS)
   target_compile_options(voiceisolate PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 
+# Standalone SSB pitch-correction filter: no model weights, no Eigen.
+add_library(pitchfix src/pitchfix.cc src/fft.cc src/wav.cc)
+target_include_directories(pitchfix
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${VI_THIRD_PARTY})
+target_compile_options(pitchfix PRIVATE -O3 -fno-math-errno)
+if(VI_NATIVE)
+  target_compile_options(pitchfix PRIVATE -march=native)
+endif()
+if(VI_WARNINGS)
+  target_compile_options(pitchfix PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+
+add_executable(pitchfix-cli apps/pitchfix_cli.cc)
+target_link_libraries(pitchfix-cli PRIVATE pitchfix)
+
+add_executable(pitchfix_tests tests/pitchfix_tests.cc)
+target_link_libraries(pitchfix_tests PRIVATE pitchfix)
+
 add_executable(voice-isolate-cli apps/vi_cli.cc)
 target_link_libraries(voice-isolate-cli PRIVATE voiceisolate)
 target_compile_options(voice-isolate-cli PRIVATE -O3)
@@ -114,3 +132,4 @@ target_compile_options(vi_tests PRIVATE -O3)
 
 enable_testing()
 add_test(NAME vi_tests COMMAND vi_tests ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME pitchfix_tests COMMAND pitchfix_tests)
