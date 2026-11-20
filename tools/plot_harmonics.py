@@ -301,6 +301,7 @@ def follow_stable(cand, green, dt, conf=None, window_s=3.0, value_s=0.2, tol_gre
     valid = np.isfinite(cand) & ~mixed & (cand >= lo) & (cand <= hi)
 
     out = np.full(nfr, np.nan)
+    chosen = np.full(nfr, -1, np.int32)
     cur = -1
     alt = -1
     alt_run = 0
@@ -337,7 +338,50 @@ def follow_stable(cand, green, dt, conf=None, window_s=3.0, value_s=0.2, tol_gre
                 out[i] = last
         if np.isfinite(out[i]):
             last = out[i]
-    return out, spread, mixed
+        chosen[i] = cur
+    return out, spread, mixed, chosen
+
+
+def inertial_attractor(cand, conf, chosen, dt, window_s=3.0, conf_hi=0.30, tau=1.5):
+    """Pink line: inertial attractor pulled by the voted high-confidence centre of mass.
+
+    The centre of mass of the chosen population is averaged over the last window_s
+    seconds with weights conf^2, so high-confidence frames pull harder. When a frame
+    has no high-confidence support the previous centre of mass keeps pulling, so the
+    line never wanders off during a dropout. Motion is a critically damped spring of
+    time constant tau: it has inertia and cannot jump.
+    """
+    nfr = cand.shape[0]
+    W = max(3, int(round(window_s / dt)))
+
+    target = np.full(nfr, np.nan)
+    strength = np.zeros(nfr)
+    last_t = np.nan
+    for i in range(nfr):
+        k = int(chosen[i])
+        if 0 <= k < cand.shape[1]:
+            w = cand[max(0, i - W + 1):i + 1, k]
+            c = conf[max(0, i - W + 1):i + 1]
+            m = np.isfinite(w) & (c >= conf_hi)
+            if m.any():
+                last_t = float(np.average(w[m], weights=c[m] ** 2))
+                strength[i] = float(np.mean(c[m]))
+        target[i] = last_t
+
+    out = np.full(nfr, np.nan)
+    x = np.nan
+    v = 0.0
+    for i in range(nfr):
+        t = target[i]
+        if not np.isfinite(t):
+            continue
+        if not np.isfinite(x):
+            x = t
+        omega = 2.0 * np.pi / tau * (0.4 + 0.6 * strength[i])  # hi-confidence pulls harder
+        v += (omega * omega * (t - x) - 2.0 * omega * v) * dt
+        x += v * dt
+        out[i] = x
+    return out, target
 
 
 def main() -> None:
@@ -353,6 +397,8 @@ def main() -> None:
     ap.add_argument("--cand", type=int, default=4, help="candidate f0 lines below f1")
     ap.add_argument("--follow-s", type=float, default=3.0, dest="follow_s",
                     help="seconds of history used to judge which population is stable")
+    ap.add_argument("--inertia-s", type=float, default=1.5, dest="inertia_s",
+                    help="time constant of the pink inertial attractor [s]")
     ap.add_argument("--slew", type=float, default=0.0,
                     help="max speed of the stable-population line [Hz/s]; 0 = unlimited")
     ap.add_argument("--conf-min", type=float, default=0.10, dest="conf_min",
@@ -476,13 +522,16 @@ def main() -> None:
                           np.stack([t[ri] + dt, y], axis=1)], axis=1)
         ax2.add_collection(LineCollection(seg_n, colors="#ff3b3b", linewidths=0.9, alpha=0.9))
     # thick, pale cyan line: the most stable candidate population, followed lazily
-    follow, _, _ = follow_stable(cpos, np.where(present, lines, np.nan), dt, conf=conf,
+    follow, _, _, chosen = follow_stable(cpos, np.where(present, lines, np.nan), dt, conf=conf,
                                  window_s=args.follow_s, conf_min=args.conf_min,
                                  slew=args.slew,
                                  lo=args.disp_min + 0.02 * args.disp_max,
                                  hi=args.disp_max)
-    ax2.plot(t, follow, color="#3ef0ff", lw=3.0, alpha=0.35, solid_capstyle="round",
+    ax2.plot(t, follow, color="#3ef0ff", lw=1.2, alpha=0.55, solid_capstyle="round",
              zorder=9)
+    pink, _ = inertial_attractor(cpos, conf, chosen, dt, window_s=args.follow_s,
+                                 tau=args.inertia_s)
+    ax2.plot(t, pink, color="#ff5ea8", lw=2.2, alpha=0.95, zorder=10)
     ax2.set_yticks(np.arange(args.disp_min, args.disp_max + 0.5 * args.ytick, args.ytick))
     if y_lo < args.disp_min:
         print(f"note: lowest drawn candidate {y_lo:.0f} Hz is below the display window")
@@ -501,8 +550,10 @@ def main() -> None:
     ax2.legend(
         handles=[Line2D([], [], color="#00ff5a", lw=1.4, label="harmonic f_k = phi + k*f0"),
                  Line2D([], [], color="#ff3b3b", lw=1.0, label="f0 candidates phi - k*s"),
-                 Line2D([], [], color="#3ef0ff", lw=3.0, alpha=0.5,
+                 Line2D([], [], color="#3ef0ff", lw=1.2, alpha=0.6,
                         label=f"stable population ({args.follow_s:g}s)"),
+                 Line2D([], [], color="#ff5ea8", lw=2.2,
+                        label=f"inertial attractor (tau {args.inertia_s:g}s)"),
                  Line2D([], [], color="#7fe9ff", lw=1.2, alpha=0.6, label="confidence"),
                  Line2D([], [], color="#ffd39b", lw=1.0, label="phi of that frame")],
         loc="upper right", facecolor="black", edgecolor="#444", labelcolor="white", fontsize=8,
