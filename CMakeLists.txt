@@ -15,13 +15,8 @@ option(VI_SME2 "Enable ARM SME2 matrix kernels when supported by compiler" ON)
 include(CheckCXXSourceCompiles)
 
 # Portable kernel sources: Eigen (GEMM), pocketfft (FFT). Both header-only.
-# They are not vendored; tools/fetch_third_party.sh downloads the pinned versions.
+# They are vendored so the build needs no network.
 set(VI_THIRD_PARTY ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
-foreach(need Eigen/Core xsimd/xsimd.hpp pocketfft_hdronly.h)
-  if(NOT EXISTS ${VI_THIRD_PARTY}/${need})
-    message(FATAL_ERROR "third_party/${need} is missing. Run tools/fetch_third_party.sh first.")
-  endif()
-endforeach()
 
 add_library(voiceisolate
   src/model.cc
@@ -68,6 +63,11 @@ if(VI_SME2 AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
     )
     message(STATUS "ARM NEON FP16 vector kernels enabled")
   endif()
+endif()
+set(VI_OPENBLAS_LIBRARY "" CACHE FILEPATH "Optional OpenBLAS library for x86 GEMM")
+if(VI_OPENBLAS_LIBRARY)
+  target_compile_definitions(voiceisolate PRIVATE VI_USE_OPENBLAS=1)
+  target_link_libraries(voiceisolate PUBLIC ${VI_OPENBLAS_LIBRARY})
 endif()
 find_package(Threads REQUIRED)
 target_link_libraries(voiceisolate PUBLIC Threads::Threads)
