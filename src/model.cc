@@ -993,12 +993,6 @@ void Model::linear_par_avx2(const float* a, int m, int k, int stride,
       const int64_t tile = static_cast<int64_t>(tiles) * chunk / qchunks;
       return static_cast<int>(std::min<int64_t>(m, 4 * tile));
     };
-    default_pool().parallel_for(qchunks, [&](int index) {
-      const int r0 = qboundary(index), r1 = qboundary(index + 1);
-      quantize_avx2_rows(a + static_cast<size_t>(r0) * stride, r1 - r0, k,
-                         stride, aq + static_cast<size_t>(r0) * k,
-                         sc.q8s.data() + r0);
-    });
     const int gchunks = std::min(threads, ntiles);
     double l_qq = 0;
     {
