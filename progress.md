@@ -1132,3 +1132,27 @@ So the port itself still matches the realtime reference on this new file
 entirely the sliding-window default versus the reference's lane restarts — the
 same ~7 dB divergence measured when the sliding default was adopted. Zero lag:
 no time shift, correlation 0.89.
+
+### Python realtime (streaming) reference, 2026-11-20 14:43 CET
+
+Same input, the realtime checkpoint — this is the one the C++ port implements:
+
+```
+voice-isolate audio_7133500Hz_…-2026.wav audio_7133500Hz_…-2026.py-realtime.wav \
+    --mode streaming --lookahead 4 --no-background
+DONE 1/1 (12s)      real 13.98
+```
+
+Output: 48 kHz mono **PCM16**, 1 207 680 samples, 25.160 s (same container the
+old `.clean2.wav` reference used). Kept under its own name so the delivered
+`…-2026.clean2.wav` (our int8 run) is not overwritten.
+
+| comparison | SNR |
+|---|---:|
+| py-realtime PCM16 vs the float32 streaming run | 64.6 dB (16-bit floor, max 3.05e-05) |
+| our fp32 restart 600/200 vs python streaming | **68.9 dB**, max 4.07e-04 |
+| our int8 sliding vs python streaming | 6.7 dB, lag 0 samples, corr 0.89 |
+
+Levels: python realtime peak 0.658 / rms 0.0299, ours 0.805 / 0.0285 — the
+sliding-window default keeps ~1.7 dB more peak, consistent with the operator
+listening notes when sliding was adopted.
