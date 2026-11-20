@@ -557,3 +557,60 @@ All three operating points now run comfortably faster than realtime on CPU alone
 - **Reference quality:** default `--quant fp32` (**1.45× realtime**, 117.5 dB vs Python float32, ~70 dB vs PCM16) or `--quant fp32 --fp16-kv` (**1.62× realtime**, 72.1 dB vs fp32, half KV RAM).
 - **Best speed/quality sweet spot:** `--quant fp16` (**1.88–2.00× realtime**, **55.6 dB** vs fp32, zero temporal drift).
 - **Maximum CPU throughput:** `--quant int8` (**2.35× realtime** on 44.29 s / **2.93× realtime** on 5 s, 19.9 dB vs fp32).
+
+---
+
+## x86-64 (AMD / Intel) investigation — 2026-11-20
+
+The x86 measurements below were made on Linux with an AMD Ryzen 9 3900X
+(AVX2/FMA, 12 CPUs visible), using the 48 kHz mono recording and four-frame
+streaming blocks. They establish behavior on this AMD machine, not a benchmark
+on an Intel CPU. The default fp32 path and the 600/200-frame window/crossfade
+were used. These wall times are individual measurements, not medians. The 5 s
+excerpt does not fill the attention window and is not representative of the
+full recording's steady-state cost.
+
+### Changes and measurements
+
+- The x86 build exposed a missing `<vector>` include in `vecmath.cc`, because
+  the non-NEON scan fallback uses `std::vector`. Adding it fixes the build.
+- The previous x86 Mamba scan evaluated each channel separately with scalar
+  `std::exp`. An SSE2 path now processes the four adjacent channels in the
+  existing `[inner/4][state][4]` layout together with xsimd, preserving the
+  carried state. The NEON and SME2 paths remain in place. On the 5 s excerpt,
+  eight threads, the same-source scalar baseline took 13.72 s wall with 2.84 s
+  attributed to scan; the SSE2 build took 11.67 s wall with 1.19 s in scan.
+  These runs used Eigen GEMM and included CLI/model startup, so treat the
+  differences as indicative rather than controlled statistical estimates.
+- An optional OpenBLAS GEMM path can be enabled with
+  `-DVI_OPENBLAS_LIBRARY=/path/to/libopenblas.so`. It uses the existing worker
+  pool and sets OpenBLAS to one thread per call (a process-wide setting). SME2
+  still takes priority where available. On the same 5 s excerpt with eight
+  threads, SSE2 plus OpenBLAS took 10.52 s wall; the profile attributed 5.93 s
+  to GEMM and 1.24 s to scan. The Eigen/SSE2 run attributed 7.17 s to GEMM.
+- A first AVX2 int8 dot-product experiment took 12.04 s on the 5 s excerpt,
+  slower than fp32 with OpenBLAS; it was discarded. The ARM int8 kernels are
+  unchanged. This result does not rule out a better tiled or packed x86 kernel.
+
+### Full-file verification and limits
+
+Before merging the later `master` changes, the restored CLI with SSE2 and
+OpenBLAS processed 44.29 s in 106.19 s with eight threads: **0.42× realtime**.
+Its stage profile reported 57.05 s in GEMM and 11.18 s in scan. It produced
+2,125,746 samples, the same count as `clean2.wav`, with **69.71 dB SNR** and
+maximum absolute difference **6.10e-5** relative to that PCM16 reference. The
+5 s optimized outputs were within one PCM16 step of the same-source scalar
+baseline (at least 97.7 dB SNR).
+
+Both the portable (`VI_NATIVE=OFF`) and OpenBLAS builds passed CTest after the
+merge with the newer `master`; the new direct scan test covers carried state,
+zero-initialized state and a channel slice. The optional `ref/` fixtures were
+absent, so the Python stage, windowed and cache-compaction reference tests were
+skipped. The full-file timing and comparison above were made before that merge
+and should be rerun for performance claims about the merged version. ARM and
+Metal execution were not tested on this x86 host.
+
+The realtime goal remains unmet on this machine. GEMM is the largest measured
+cost; further work should benchmark better packed/vectorized x86 kernels and
+threading against the full recording, while checking the quality impact of any
+lower-precision mode. See `README-intel.md` for build and CLI commands.
