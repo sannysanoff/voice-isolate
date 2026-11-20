@@ -1,6 +1,7 @@
 // Numerical and reference tests for the portable voice isolator.
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -174,6 +175,9 @@ void test_reference(const std::string& root) {
   std::printf("reference stages (%zu samples)\n", input.size());
 
   auto model = std::make_shared<vi::Model>(weights);
+  // VI_QUANT=1 runs the same stage comparison through the int8 dense layers, to
+  // see where the quantisation error accumulates.
+  if (std::getenv("VI_QUANT") != nullptr) model->set_quant(true);
   const vi::Config& cfg = model->config();
   const int bands = cfg.bands();
   const int width = cfg.width;

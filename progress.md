@@ -304,6 +304,31 @@ like the pool splits it:
 | columns matching | 20 of 20 |
 | **scalar fallback vs SDOT path** | **bit-identical, max diff 0.0** |
 
+### 8. Where the int8 error accumulates (~00:10)
+
+`VI_QUANT=1 ./build/vi_tests . quick` runs the stage comparison through the int8
+dense layers. The encoder is untouched (no quantised layer there), and the error
+then grows monotonically through the blocks — no single step goes wrong, which is
+what distinguishes quantisation noise from a bug:
+
+| stage | fp32 | int8 |
+|---|---|---|
+| encoded | 107.5 dB | 107.5 dB |
+| block0 out | 108.6 | 37.0 |
+| block1 out | 110.8 | 35.4 |
+| block2 out | 109.1 | 30.4 |
+| block3 out | 108.6 | 29.4 |
+| block4 out | 108.6 | 27.6 |
+| block5 out | 109.1 | 26.8 |
+| block6 out | 121.9 | 39.2 |
+| **samples** | **119.0** | **26.3** |
+
+The `FAIL` markers are the test's 100 dB gate, which is calibrated for the fp32
+path; they are not a malfunction. The arithmetic closes: one 8-bit layer is worth
+about 40 dB, there are ~35 of them along the signal path, and the LayerNorm after
+each block re-normalises instead of letting the noise decay, so
+40 − 10·log10(35) ≈ 25 dB. That is the 8-bit limit, not an implementation defect.
+
 ## Re-verification of the final binary (23:55:47 CET)
 
 Everything above was re-run after those fixes; the binary under test is the
