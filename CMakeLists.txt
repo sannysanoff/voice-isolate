@@ -15,8 +15,13 @@ option(VI_SME2 "Enable ARM SME2 matrix kernels when supported by compiler" ON)
 include(CheckCXXSourceCompiles)
 
 # Portable kernel sources: Eigen (GEMM), pocketfft (FFT). Both header-only.
-# They are vendored so the build needs no network.
+# They are not vendored; tools/fetch_third_party.sh downloads the pinned versions.
 set(VI_THIRD_PARTY ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+foreach(need Eigen/Core xsimd/xsimd.hpp pocketfft_hdronly.h)
+  if(NOT EXISTS ${VI_THIRD_PARTY}/${need})
+    message(FATAL_ERROR "third_party/${need} is missing. Run tools/fetch_third_party.sh first.")
+  endif()
+endforeach()
 
 add_library(voiceisolate
   src/model.cc

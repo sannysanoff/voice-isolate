@@ -27,17 +27,21 @@ realtime). On a CPU it is compute-bound; see [Performance](#performance).
 ## Build
 
 ```bash
+tools/fetch_third_party.sh          # one time, network needed
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
+ctest --test-dir build --output-on-failure
 ```
 
-Dependencies are vendored, header-only, and need no network:
+The three dependencies are header-only. The repository references them, it
+does not vendor them; `tools/fetch_third_party.sh` downloads the pinned
+versions into `third_party/` (git-ignored):
 
 | | used for | licence |
 |---|---|---|
-| [Eigen 3.4](https://gitlab.com/libeigen/eigen) | GEMM, `third_party/Eigen` | MPL-2.0 |
-| [pocketfft](https://github.com/mreineck/pocketfft) | the 2048-point real FFT (what NumPy/SciPy use) | BSD-3 |
-| [xsimd 13](https://github.com/xtensor-stack/xsimd) | portable SIMD `exp`/`erf`/`tanh`/`log1p` for the state-space scan and activations | BSD-3 |
+| [Eigen 3.4.0](https://gitlab.com/libeigen/eigen) | GEMM, `third_party/Eigen` | MPL-2.0 |
+| [pocketfft](https://github.com/mreineck/pocketfft) commit `4d865cb` | the 2048-point real FFT (what NumPy/SciPy use) | BSD-3 |
+| [xsimd 13.2.0](https://github.com/xtensor-stack/xsimd) | portable SIMD `exp`/`erf`/`tanh`/`log1p` for the state-space scan and activations | BSD-3 |
 
 `-DVI_NATIVE=ON` adds `-march=native` (drops binary portability).
 
