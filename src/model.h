@@ -10,6 +10,7 @@
 
 #include "common.h"
 #include "gemm_int8.h"
+#include "gemm_sme.h"
 #include "fft.h"
 
 namespace vi {
@@ -31,7 +32,8 @@ struct Rope {
 // One block's time-attention past for one lane: a key lives at the slot that is
 // its rotary position, so it is rotated exactly once, when it is written.
 struct AttnState {
-  std::vector<float> k, v;  // [bands][capacity][width]
+  std::vector<float> k, v;        // [bands][head][capacity][hd] (fp32 KV cache)
+  std::vector<uint16_t> k16, v16; // [bands][head][capacity][hd] (fp16 KV cache)
   int capacity = 0;
   int end = 0;
 
@@ -39,6 +41,8 @@ struct AttnState {
   void release() {
     k.clear();
     v.clear();
+    k16.clear();
+    v16.clear();
     capacity = 0;
     end = 0;
   }
@@ -74,10 +78,24 @@ class Model {
   size_t weight_bytes() const { return weights_.bytes(); }
   size_t scratch_bytes() const;
 
-  // int8 weight-only dense layers. Off by default: the fp32 path is the
-  // reference-verified one, and the quantised path trades accuracy for speed.
-  void set_quant(bool on) { quant_enabled_ = on; }
-  bool quant_enabled() const { return quant_enabled_; }
+  enum class QuantMode {
+    Fp32 = 0,
+    Fp16 = 1,
+    Bf16 = 2,
+    Int8 = 3,
+    Int8Group = 4,
+  };
+
+  // Precision mode for dense layers. Fp32 is the reference-verified default.
+  void set_quant(bool on) {
+    set_quant_mode(on ? QuantMode::Int8 : QuantMode::Fp32);
+  }
+  void set_quant_mode(QuantMode mode);
+  QuantMode quant_mode() const { return quant_mode_; }
+  bool quant_enabled() const { return quant_mode_ != QuantMode::Fp32; }
+  void set_fp16_kv(bool on);
+  bool fp16_kv() const { return fp16_kv_; }
+  void prepack_weights() const;
 
   void init_lane(Lane& lane) const;
   // A lane's start: the recurrence carried, the attention past dropped.
@@ -89,9 +107,15 @@ class Model {
   // Band tokens through every block, carrying the lane's state.
   void backbone(float* feat, int frames, Lane& lane, const Rope& rope,
                 const LaneParams& lp) const;
+  // Batched dual-lane backbone for crossfade windows (halves weight reads).
+  void backbone_pair(float* feat_a, float* feat_b, int frames, Lane& lane_a,
+                     Lane& lane_b, const Rope& rope,
+                     const LaneParams& lp) const;
 
   // Band tokens -> decoder output [frames][bins][4]
   void decode(const float* feat, int frames, float* raw) const;
+  void decode_pair(const float* feat_a, const float* feat_b, int frames,
+                   float* raw_a, float* raw_b) const;
 
   // The decoder's complex change of one frame's spectrum.
   void correction(const float* raw, const std::complex<float>* spectrum,
@@ -133,8 +157,10 @@ class Model {
 
   struct MambaLayer {
     const Tensor *in_w, *conv_w, *conv_b, *x_w, *dt_w, *dt_b, *d, *out_w;
-    std::vector<float> a;       // [state][inner] = -exp(A_log)
-    std::vector<float> conv_t;  // [taps][inner] depthwise kernel, transposed
+    std::vector<float> a;              // [state][inner] = -exp(A_log)
+    std::vector<float> a_log2e4;       // [inner/4][state][4] = a * log2(e)
+    std::vector<uint16_t> a_log2e8_16; // [inner/8][state][8] fp16 = a * log2(e)
+    std::vector<float> conv_t;         // [taps][inner] depthwise kernel, transposed
   };
 
   struct MambaWeights {
@@ -168,18 +194,38 @@ class Model {
     // Per-worker scratch for the int8 activations and their row scales.
     std::vector<int8_t> q8;
     std::vector<float> q8s;
+    // Scratch for SME2 packed activations.
+    std::vector<float> sme_ap_f32;
+    std::vector<uint16_t> sme_ap_16;
+    std::vector<int8_t> sme_ap_i8;
+    std::vector<float> sme_as;
+    std::vector<float> pair;
   };
 
   Scratch& scratch(int rows) const;
   // C[m, n] = A[m, k] * W[n, k]^T + bias, columns spread over the pool.
   void linear_par(const float* a, int m, int k, const Tensor& w,
                   const float* bias, float* c) const;
-  // The int8 path; false when the layer is too small to be worth quantising.
+  // The SME2 path (handles fp32, fp16, bf16, int8, int8g when SME2 is available).
+  bool linear_par_sme(const float* a, int m, int k, int stride, const Tensor& w,
+                      const float* bias, float* c) const;
+  // The NEON int8 path; false when the layer is too small or SME2 handled it.
   bool linear_par_i8(const float* a, int m, int k, int stride, const Tensor& w,
                      const float* bias, float* c) const;
   const Int8Matrix* quantized(const Tensor& w) const;
+  const PackedF32* packed_f32(const Tensor& w) const;
+  const PackedF16* packed_f16(const Tensor& w) const;
+  const PackedBF16* packed_bf16(const Tensor& w) const;
+  const PackedI8* packed_i8(const Tensor& w) const;
+  const PackedI8Group* packed_i8g(const Tensor& w) const;
   mutable std::unordered_map<const Tensor*, Int8Matrix> quant_;
-  bool quant_enabled_ = false;
+  mutable std::unordered_map<const Tensor*, PackedF32> sme_f32_;
+  mutable std::unordered_map<const Tensor*, PackedF16> sme_f16_;
+  mutable std::unordered_map<const Tensor*, PackedBF16> sme_bf16_;
+  mutable std::unordered_map<const Tensor*, PackedI8> sme_i8_;
+  mutable std::unordered_map<const Tensor*, PackedI8Group> sme_i8g_;
+  QuantMode quant_mode_ = QuantMode::Fp32;
+  bool fp16_kv_ = false;
   void linear_par(const float* a, int m, int k, int stride, const Tensor& w,
                   const float* bias, float* c) const;
   // cost_per_element lets the caller say a kernel is expensive (erf, exp).
@@ -200,12 +246,20 @@ class Model {
   void time_transformer(const AttnWeights& w, float* feat, int frames,
                         AttnState& state, const Rope& rope,
                         const LaneParams& lp) const;
+  void time_transformer_pair(const AttnWeights& w, float* pair_feat, int frames,
+                             AttnState& st_a, AttnState& st_b, const Rope& rope,
+                             const LaneParams& lp) const;
   void band_transformer(const AttnWeights& w, float* feat, int frames) const;
+  void band_transformer_core(const AttnWeights& w, float* trans,
+                             int frames) const;
   // One Mamba layer over `rows` tokens: rows = tasks * len, each task a
   // sequence of `len` tokens. Carries conv/ssm state when given.
   void mamba_layer(const MambaLayer& l, const float* x, int rows, int len,
                    float* out, float* conv_state, float* ssm_state,
                    float* slab_ext, float* slab_decay, float* slab_h) const;
+  void mamba_layer_pair(const MambaLayer& l, const float* x, int rows_each,
+                        int len, float* out, float* conv_a, float* ssm_a,
+                        float* conv_b, float* ssm_b, float* slab_ext) const;
 
   Config cfg_;
   Weights weights_;

@@ -24,7 +24,8 @@ void usage() {
       "  --cache-frames N     attention lookback (default: checkpoint)\n"
       "  --threads N          worker threads (default: all cores)\n"
       "  --float32            write float32 WAV instead of PCM16\n"
-      "  --quant int8         int8 weights for the dense layers (faster, lossy)\n"
+      "  --quant MODE         dense precision: fp32 (default), fp16, bf16, int8, int8g\n"
+      "  --fp16-kv            store time-attention KV cache in fp16 (faster, half RAM)\n"
       "  --filter             raw float32 mono on stdin, filter on stdout\n"
       "  --chunk N            filter mode: samples per read (default 480)\n"
       "  --quiet              no timing report\n"
@@ -39,7 +40,10 @@ int main(int argc, char** argv) {
   vi::StreamOptions options;
   int threads = 0;
   bool float32 = false;
-  bool quant = false;
+  vi::Model::QuantMode quant_mode = vi::Model::QuantMode::Fp32;
+  std::string quant_name = "fp32";
+  bool fp16_kv = false;
+  bool fp16_kv_explicit = false;
   bool filter = false;
   bool quiet = false;
   int chunk = 480;
@@ -62,8 +66,16 @@ int main(int argc, char** argv) {
     else if (arg == "--threads") threads = std::stoi(next());
     else if (arg == "--chunk") chunk = std::stoi(next());
     else if (arg == "--float32") float32 = true;
-    else if (arg == "--quant")
-      quant = next() == "int8";
+    else if (arg == "--quant") {
+      quant_name = next();
+      if (quant_name == "fp32") quant_mode = vi::Model::QuantMode::Fp32;
+      else if (quant_name == "fp16") quant_mode = vi::Model::QuantMode::Fp16;
+      else if (quant_name == "bf16") quant_mode = vi::Model::QuantMode::Bf16;
+      else if (quant_name == "int8") quant_mode = vi::Model::QuantMode::Int8;
+      else if (quant_name == "int8g") quant_mode = vi::Model::QuantMode::Int8Group;
+      else { usage(); return 2; }
+    }
+    else if (arg == "--fp16-kv") { fp16_kv = true; fp16_kv_explicit = true; }
     else if (arg == "--filter") filter = true;
     else if (arg == "--quiet") quiet = true;
     else if (arg == "--profile") vi::Model::profile_enabled() = true;
@@ -78,16 +90,22 @@ int main(int argc, char** argv) {
 
   try {
     auto model = std::make_shared<vi::Model>(model_dir);
-    model->set_quant(quant);
+    model->set_quant_mode(quant_mode);
+    if (fp16_kv_explicit)
+      model->set_fp16_kv(fp16_kv);
+    else if (quant_mode != vi::Model::QuantMode::Fp32)
+      model->set_fp16_kv(true);
     vi::Stream stream(model, options);
     if (!quiet)
       std::fprintf(stderr,
-                   "weights %.1f MB, threads %d, %s, look-ahead %d frames, latency "
+                   "weights %.1f MB, threads %d, %s weights%s%s, look-ahead %d frames, latency "
                    "%d samples (%.1f ms), attention window %d frames, cache "
                    "%d frames\n",
                    static_cast<double>(model->weight_bytes()) / 1e6,
                    vi::default_pool().size(),
-                   quant ? "int8 weights" : "fp32 weights",
+                   quant_name.c_str(),
+                   vi::sme2_available() ? " (SME2)" : "",
+                   model->fp16_kv() ? " + fp16-kv" : "",
                    stream.lookahead_frames(),
                    stream.latency_samples(),
                    1000.0 * stream.latency_samples() / stream.sample_rate(),

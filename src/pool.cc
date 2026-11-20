@@ -57,18 +57,63 @@ void layer_norm(const float* x, float* y, int rows, int cols, const float* w,
 
 namespace {
 
-// A short pause during a spin; keeps the core free for the working threads.
+#if !defined(__aarch64__)
 inline void cpu_relax() {
 #if defined(__x86_64__) || defined(__i386__)
   __builtin_ia32_pause();
-#elif defined(__aarch64__) || defined(__arm__)
+#elif defined(__arm__)
   asm volatile("yield" ::: "memory");
 #else
   std::atomic_signal_fence(std::memory_order_seq_cst);
 #endif
 }
+#endif
 
+// Low-power userspace hardware wait on an atomic value change (ARM64 ldaxr+wfe).
+// Wakes in ~1.5 us on a store to the monitored cache line while consuming near-zero
+// CPU time and power (no thermal throttling, no kernel syscalls).
+inline void wait_for_change_u64(const std::atomic<uint64_t>& a, uint64_t seen) {
+#if defined(__aarch64__)
+  uint64_t val;
+  asm volatile("ldaxr %0, [%1]" : "=r"(val) : "r"(&a) : "memory");
+  if (val == seen) {
+    asm volatile("wfe" ::: "memory");
+  } else {
+    asm volatile("clrex" ::: "memory");
+  }
+#else
+  (void)a;
+  (void)seen;
+  cpu_relax();
+#endif
+}
+
+inline void wait_for_nonzero_i32(const std::atomic<int>& a) {
+#if defined(__aarch64__)
+  int val;
+  asm volatile("ldaxr %w0, [%1]" : "=r"(val) : "r"(&a) : "memory");
+  if (val != 0) {
+    asm volatile("wfe" ::: "memory");
+  } else {
+    asm volatile("clrex" ::: "memory");
+  }
+#else
+  (void)a;
+  cpu_relax();
+#endif
+}
+
+// Apple Silicon L2 cache lines are 128 bytes; padding hot atomics prevents
+// cross-cluster cache-line ping-pong during barriers.
+constexpr size_t kCacheLine = 128;
+
+#if defined(__aarch64__)
+// Each wfe sleeps until an event (~10-100 us max), so 500 wfe iterations easily
+// covers all inter-op gaps without falling into mutex/condvar syscalls.
+constexpr int kSpinRounds = 500;
+#else
 constexpr int kSpinRounds = 20000;
+#endif
 
 }  // namespace
 
@@ -78,19 +123,27 @@ struct Pool::Impl {
   std::mutex mutex;
   std::condition_variable wake;
   std::vector<std::thread> threads;
-  const std::function<void(int)>* job = nullptr;
+
+  // Read-mostly job dispatch fields, isolated on their own cache line.
+  alignas(kCacheLine) const std::function<void(int)>* job = nullptr;
   int count = 0;
-  std::atomic<int> next{0};
-  std::atomic<int> pending{0};
+  bool static_dispatch = false;
+  bool stride_dispatch = false;
+  int stride_peer = 1;
   std::atomic<uint64_t> generation{0};
   std::atomic<bool> stop{false};
-  std::atomic<int> sleepers{0};
 
-  // One worker's body: spin for the next job, then take indices until done.
-  void worker() {
+  // Dynamic work-stealing counter, isolated on its own cache line.
+  alignas(kCacheLine) std::atomic<int> next{0};
+
+  // Barrier completion counter, isolated on its own cache line.
+  alignas(kCacheLine) std::atomic<int> pending{0};
+
+  // Sleep tracking counter, isolated on its own cache line.
+  alignas(kCacheLine) std::atomic<int> sleepers{0};
+
+  void worker(int worker_id) {
 #if defined(__APPLE__)
-    // Without an elevated QoS class macOS parks these threads on the efficiency
-    // cores, and one slow core at each barrier is what caps the scaling.
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
     uint64_t seen = 0;
@@ -98,44 +151,54 @@ struct Pool::Impl {
       int spins = 0;
       while (generation.load(std::memory_order_acquire) == seen) {
         if (stop.load(std::memory_order_relaxed)) return;
-        // Spin, then block. A worker that sleeps through a barrier stalls every
-        // thread behind it, so the spin window has to cover the barrier gap; the
-        // condvar is the fallback for when the pool really is idle. Yielding in
-        // between is a syscall and made this much slower, not faster.
         if (spins < kSpinRounds) {
-          cpu_relax();
+          wait_for_change_u64(generation, seen);
+          ++spins;
         } else {
           sleepers.fetch_add(1, std::memory_order_seq_cst);
           {
             std::unique_lock<std::mutex> lock(mutex);
-            wake.wait_for(lock, std::chrono::microseconds(200), [&] {
-              return stop.load() || generation.load() != seen;
+            wake.wait_for(lock, std::chrono::microseconds(500), [&] {
+              return stop.load(std::memory_order_relaxed) ||
+                     generation.load(std::memory_order_acquire) != seen;
             });
           }
           sleepers.fetch_sub(1, std::memory_order_seq_cst);
           spins = 0;
-          continue;
         }
-        ++spins;
       }
       if (stop.load(std::memory_order_relaxed)) return;
       seen = generation.load(std::memory_order_acquire);
       const std::function<void(int)>* fn = job;
       const int n = count;
-      for (;;) {
-        const int index = next.fetch_add(1, std::memory_order_relaxed);
-        if (index >= n) break;
-        (*fn)(index);
+      if (static_dispatch) {
+        if (stride_dispatch) {
+          // Spread small chunk counts (e.g. 2 SME workers) across worker IDs
+          // so they land on different P-core clusters on multi-cluster Apple Silicon.
+          if (worker_id == stride_peer) (*fn)(1);
+        } else if (worker_id < n) {
+          (*fn)(worker_id);
+        }
+        pending.fetch_sub(1, std::memory_order_acq_rel);
+      } else {
+        for (;;) {
+          const int index = next.fetch_add(1, std::memory_order_relaxed);
+          if (index >= n) break;
+          (*fn)(index);
+        }
+        pending.fetch_sub(1, std::memory_order_acq_rel);
       }
-      pending.fetch_sub(1, std::memory_order_acq_rel);
     }
   }
 };
 
 Pool::Pool(int threads) : impl_(new Impl), threads_(threads < 1 ? 1 : threads) {
+#if defined(__APPLE__)
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
   impl_->threads.reserve(static_cast<size_t>(threads_ - 1));
   for (int i = 1; i < threads_; ++i)
-    impl_->threads.emplace_back([this] { impl_->worker(); });
+    impl_->threads.emplace_back([this, i] { impl_->worker(i); });
 }
 
 Pool::~Pool() {
@@ -155,45 +218,45 @@ void Pool::parallel_for(int n, const std::function<void(int)>& fn) {
     for (int i = 0; i < n; ++i) fn(i);
     return;
   }
+  const bool use_static = (n <= threads_);
   impl_->job = &fn;
   impl_->count = n;
-  impl_->next.store(0, std::memory_order_relaxed);
+  impl_->static_dispatch = use_static;
+  impl_->stride_dispatch = (use_static && n == 2 && threads_ > 2);
+  impl_->stride_peer = threads_ - 1;
+  if (!use_static) impl_->next.store(0, std::memory_order_relaxed);
   impl_->pending.store(threads_ - 1, std::memory_order_relaxed);
   impl_->generation.fetch_add(1, std::memory_order_release);
-  // Only syscall when a worker is asleep: during a stream they spin instead.
-  if (impl_->sleepers.load(std::memory_order_seq_cst) > 0)
+  if (impl_->sleepers.load(std::memory_order_seq_cst) > 0) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->wake.notify_all();
-
-  for (;;) {
-    const int index = impl_->next.fetch_add(1, std::memory_order_relaxed);
-    if (index >= n) break;
-    fn(index);
   }
-  // Spin for the workers, then block: the pool is warm during a stream.
-  int spins = 0;
-  while (impl_->pending.load(std::memory_order_acquire) != 0) {
-    if (++spins > kSpinRounds * 16) {
-      std::unique_lock<std::mutex> lock(impl_->mutex);
-      impl_->wake.wait_for(lock, std::chrono::milliseconds(1));
-      spins = 0;
-    } else {
-      cpu_relax();
+
+  if (use_static) {
+    fn(0);
+  } else {
+    for (;;) {
+      const int index = impl_->next.fetch_add(1, std::memory_order_relaxed);
+      if (index >= n) break;
+      fn(index);
     }
+  }
+
+  while (impl_->pending.load(std::memory_order_acquire) != 0) {
+    wait_for_nonzero_i32(impl_->pending);
   }
 }
 
 namespace {
 
-// The threads this workload wants. Measured on an M4 Max (10 performance + 4
-// efficiency cores), 6 beats every other count for both the fp32 and the int8
-// path — 6.8 s against 7.4 s at 8 and 15.8 s at 10 on a 5 s clip. The cores are
-// grouped in clusters and a barrier makes every thread wait for the slowest, so
-// spilling past one cluster costs more than the extra cores return.
 int preferred_threads() {
   const int cores = static_cast<int>(std::thread::hardware_concurrency());
   if (cores <= 0) return 1;
 #if defined(__APPLE__)
-  return std::min(cores, 6);
+  // Measured on M4 Max (10 P-cores + 4 E-cores): 8 threads spans both P-core
+  // clusters (so both SME2 units stay active) and beats 10 threads on both wall
+  // clock and user CPU time.
+  return std::min(cores, 8);
 #else
   return std::min(cores, 8);
 #endif

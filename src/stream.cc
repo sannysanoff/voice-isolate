@@ -150,10 +150,10 @@ void Stream::run_frames(int64_t first, int count) {
   } else {
     model_->encode(spectra_.data(), count, feat_a_.data());
     std::memcpy(feat_b_.data(), feat_a_.data(), sizeof(float) * feat_size * count);
-    model_->backbone(feat_a_.data(), count, lane_a_, rope_, lane_params_);
-    model_->decode(feat_a_.data(), count, raw_a_.data());
-    model_->backbone(feat_b_.data(), count, lane_b_, rope_, lane_params_);
-    model_->decode(feat_b_.data(), count, raw_b_.data());
+    model_->backbone_pair(feat_a_.data(), feat_b_.data(), count, lane_a_,
+                          lane_b_, rope_, lane_params_);
+    model_->decode_pair(feat_a_.data(), feat_b_.data(), count, raw_a_.data(),
+                        raw_b_.data());
     for (int t = 0; t < count; ++t) {
       const double weight = std::clamp(
           static_cast<double>(within + t - crossfade_start + 1) /
