@@ -1671,6 +1671,24 @@ void v_attn1_pv_f16(const float* __restrict s, float inv,
 #endif
 }
 
+// Scalar row quantize, shared by every architecture: it is the fallback when the
+// x86 AVX2 path is absent and the tail handler when it is present.
+namespace {
+inline void quantize_kv_row_scalar(const float* src, int8_t* dst, int n,
+                                   float* scale) {
+  float peak = 0.0f;
+  for (int i = 0; i < n; ++i) peak = std::max(peak, std::fabs(src[i]));
+  const float s = peak > 0.0f ? peak / 127.0f : 1.0f;
+  *scale = s;
+  const float inv = 1.0f / s;
+  for (int i = 0; i < n; ++i) {
+    int q = static_cast<int>(std::nearbyint(src[i] * inv));
+    dst[i] = static_cast<int8_t>(std::min(127, std::max(-127, q)));
+  }
+}
+
+}  // namespace
+
 // ------------------------------------------------- x86 int8 KV cache ----
 
 bool kv_i8_available() {
@@ -1687,19 +1705,6 @@ bool kv_i8_available() {
 namespace {
 
 // Scalar row quantize (fallback + tails): symmetric per-token scale.
-inline void quantize_kv_row_scalar(const float* src, int8_t* dst, int n,
-                                   float* scale) {
-  float peak = 0.0f;
-  for (int i = 0; i < n; ++i) peak = std::max(peak, std::fabs(src[i]));
-  const float s = peak > 0.0f ? peak / 127.0f : 1.0f;
-  *scale = s;
-  const float inv = 1.0f / s;
-  for (int i = 0; i < n; ++i) {
-    int q = static_cast<int>(std::nearbyint(src[i] * inv));
-    dst[i] = static_cast<int8_t>(std::min(127, std::max(-127, q)));
-  }
-}
-
 // Horizontal sum of 8 floats.
 VI_SCAN_AVX2 inline float hsum8(__m256 v) {
   __m128 lo = _mm256_castps256_ps128(v);

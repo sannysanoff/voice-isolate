@@ -1066,3 +1066,38 @@ build. New-default timings on this box: fp32 51.51 s (0.86x), int8 22.32 s
 (1.98x). One pre-existing warning from the in-flight WIP surfaced in the
 portable build (`vecmath.cc:1237` unused `inv_s` in `v_quant_pack_a_i8_block`)
 — left for its owner to fix with their commit.
+
+## ARM build fix + new recording, 2026-11-20 14:38 CET (M4 Max, Mac16,6)
+
+The x86 session left the tree unbuildable on ARM: `v_quantize_kv_row` calls
+`quantize_kv_row_scalar` unconditionally, but the definition sat inside the
+`__x86_64__` guard, so `build-native` failed with
+`use of undeclared identifier 'quantize_kv_row_scalar'` at `vecmath.cc:1875`.
+Moved the scalar helper into its own anonymous namespace ahead of the guard — it
+is the non-AVX2 fallback and the tail handler on x86, and the only path on ARM.
+No arithmetic changed.
+
+Fresh build: `cmake -S . -B build-native -DVI_NATIVE=ON -DVI_METAL=OFF`,
+clean, and `./build-native/vi_tests . quick` all green (samples 117.5 dB).
+
+### `audio_7133500Hz_14-34-23_20-11-2026.wav` (25.16 s, 48 kHz, stereo PCM16)
+
+Requested run: `--quant int8 --window-frames 0 --threads 8`, everything else
+default (block 8, lookback 400, capacity 600). CPU only (`device cpu`),
+`int8 weights (SME2)`.
+
+| arm | processing | realtime | user CPU |
+|---|---:|---:|---:|
+| **int8, 8 threads, sliding** | **7.76 s** | **3.24x** | 61.25 s |
+| fp32, 8 threads, sliding | 11.75 s | 2.14x | 90.39 s |
+
+Output `…-2026.clean2.wav`: 48 kHz mono PCM16, 1 207 680 samples — same count as
+the input, 25.160 s, peak 0.805, rms 0.0285 against 0.0949 at the input
+(17.8 dB down on the quietest and the loudest tenth of 50 ms frames alike, so
+it is not a global gain).
+
+Checks: `int8 vs fp32` on the same input **15.7 dB** (lower than the 20.6 dB on
+the older 44 s file; this material is harder, and the per-frame split is
+unchanged in character). Sliding default vs restart 600/1200 diverges by
+**7.0 dB by design** from the first lane boundary — the restart arm was run only
+as a sanity check and is not the deliverable.
