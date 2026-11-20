@@ -21,12 +21,19 @@ OpenBLAS is restricted to one thread per call; the existing worker pool divides
 matrix work across the selected threads. This changes the OpenBLAS thread setting
 process-wide. The ARM SME2 kernels retain priority when available.
 
-The default streaming configuration uses six frames per block, a 600-frame
-window and a 200-frame crossfade. See `--help` for the filter mode and options.
-The input sample rate must match the model (48 kHz); channels are averaged to
-mono. The model directory defaults to `model` relative to the current directory.
-`--block-frames 4` remains available for bit-comparable older runs; 6 is the
-measured throughput optimum on 8-core x86 (throughput only, no latency change).
+The default streaming configuration computes eight frames per block in one
+continuous lane: no lane restarts, the attention KV cache slides with a
+400-frame lookback (`--cache-frames`). On the 8-core AVX2 laptop this runs
+the int8 path at ~2x realtime and fp32 at ~0.86x. The earlier restart mode
+(a 600-frame window with a 200-frame crossfade) remains available via
+`--window-frames 600 --cache-frames 1200`; it is the configuration the
+historical quality gates were anchored on, and the two modes diverge by
+design from the first lane boundary onward. See `--help` for the filter
+mode and options. The input sample rate must match the model (48 kHz);
+channels are averaged to mono. The model directory defaults to `model`
+relative to the current directory. `--block-frames 4` remains available for
+bit-comparable older runs; 8 is the measured throughput optimum on 8-core
+x86.
 
 `VI_NATIVE=ON` tunes the build for the build machine; use `-DVI_NATIVE=OFF` for
 an x86-64 binary intended for other machines. Run

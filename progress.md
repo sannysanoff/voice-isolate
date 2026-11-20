@@ -805,3 +805,255 @@ Remaining gap: 31.7 s -> 23.3 s (8.4 s). GEMM is at ~85-95% of the derated
 peak so the rest must come from attention math, scan, decode, data movement
 and quiet-machine clocks. Next: band-QK/PV costs, `bf` re-check with current
 code + quality, quiet-window full-file runs.
+
+### Session continued (2026-11-20, later)
+
+Determinism check: int8 bf6 run twice -> **341.57 dB, maxabs 0.0**
+(bit-identical). No pool race; workers write disjoint outputs and shared
+accumulators are order-independent. The earlier masked-batching
+double-compute bug (singles loop left alongside the masked batch) was found
+and removed; it had inflated one full-file run to 41.63 s.
+
+bf quality, current code: int8 bf8 vs matching fp32 bf8 = **23.64 dB**
+(the old 21.6 dB was a mismatched-config artifact), fp32 bf6 vs fp32 bf8 =
+98.16 dB. bf8 is quality-neutral vs bf6 (23.64 vs 23.16 dB) and ~12% faster
+on full file (30.60 s vs 34.23 s). int8 bf6 vs int8 bf8 differ by ~25 dB:
+expected cascade amplification — tiny fp32 summation-order seeds (Eigen
+blocking by M, batching) flip int8 rounding thresholds through ~35
+quantized layers. Same phenomenon explains why any non-bit-identical change
+in int8 mode lands at ~23-26 dB inter-variant SNR while staying ~23-24 dB
+vs fp32. Not a bug (determinism proven); document, don't chase.
+
+Power finding: with `performance` governor + EPP performance (enabled via
+sudo by the operator), single-thread AVX2 int8 went 169 -> **254-256 GOPS**
+(the handoff peak), but full-file wall did not move (30.60 -> 30.55 s).
+8-core AVX2 is power-capped (~2.9 GHz sustained vs 4.2+ single-core); the
+governor cannot fix it. GEMM in-situ 1355-1425 GFLOPS aggregate = ~95% of
+the 8-core power ceiling, i.e. at-peak. Clocks are out; only less work
+counts now.
+
+x86 int8 KV quality (5 s): int8+fp32KV vs fp32 = 24.82 dB; int8+int8KV vs
+fp32 = 24.51 dB (KV costs 0.3 dB). Per-token int8 suffices; no Hadamard.
+
+GELU/softplus epilogue fusion into the AVX2 int8 GEMM (raw AVX2 erf via
+A&S 7.1.26 + exp2 reuse, threshold-20 softplus via degree-13 log1p series;
+portable-safe, no xsimd which needs -mavx2 for the explicit arch):
+- GELU fusion is quality-clean (25.77 dB vs 25.60 unfused on 5 s, elem pass
+  eliminated). Kept.
+- Softplus fusion cost ~2 dB on 5 s (24.57 dB; finer log1p recovered half of
+  it). Root cause: 1e-6..1e-8 delta perturbations accumulate in time-mamba
+  scan state over thousands of steps, while GELU perturbations (no carry)
+  do not. Dropped (saves only ~0.15 s anyway); GELU-only fusion kept.
+
+Also done: `kMinParallelOps` x86 2M->100k (LN 0.11->0.02 s on 5 s),
+parallel to_frame/to_band_major + mamba reversal/cat (single+pair),
+`sc.trans+=feat` -> add_par, decode tails via padded `v_attn4_qk`
+(decode 0.24->0.15 s on 5 s), int8 KV P prescale fold (~+7% PV),
+scratch reserve-no-zero pattern (q8/q8s/bscores/bqkv/mamba_ext; removed
+resizes of the never-read decay/h slabs), madvise(MADV_HUGEPAGE) on the
+weight blob + AVX2 panels (THP `madvise` mode), column-split AVX2 GEMM with
+row-split fallback for n/16 < threads, fp32-fallback FLOP counter (only
+0.1% of FLOPs — small layers correctly stay fp32), `linear_par` now returns
+whether the epilogue fused (fp32/SME paths return false, elementwise runs).
+
+Rejected since last entry: scan as 4x4-state passes (slower: more passes
+over L1-hot data beat the spill saving, reverted), integer PV via maddubs
+(wrong reduction for per-element outputs, caught before running), integer
+QK dot (offset-correction overhead negates the uop win), band int8 QK/PV
+(quantize overhead dwarfs the tiny n=46 compute), 2D GEMM tiling (marginal
+vs colsplit at L3-resident weights), softplus fusion (above), prefetch/unroll
+in QK/PV (streams are HW-prefetched; kernel is uop-bound, not latency-bound).
+`perf` unblocked via sysctl (paranoid=1) for future counter checks;
+valgrind/AMDuProf absent, THP is `madvise` mode.
+
+Epilogue fusion follow-up: GELU-only fusion verified quality-clean
+(25.77 dB vs 25.60 unfused on 5 s, elem pass eliminated) but full-file
+(30.90 s vs 30.67) showed net-zero/negative — the hand-rolled AVX2 erf
+(~25 uops/8) is slower than xsimd's erf in the separate pass, so moving the
+ALU into the GEMM critical path outweighed the saved memory passes. Fully
+reverted (bit-identical to pre-fusion: 338 dB on 5 s). Lesson: the elem pass
+is ALU-bound (xsimd erf/exp), not memory-bound; fusion only helps if the
+epilogue ALU matches xsimd speed.
+
+Power-wall conclusion (multiple independent confirmations): single-thread
+AVX2 int8 254-256 GOPS (4.2 GHz boost) vs in-situ 169/core = exactly
+254x2.9/4.2 — in-situ runs at the 8-core AVX power cap (~2.9 GHz), with zero
+parallel scaling loss. Attention matches the same way (61 -> 42 GFLOPS).
+`performance` governor + EPP performance changed nothing vs `powersave`
+(30.60 -> 30.55 s): the limit is PPT, not policy. GEMM 1355-1425 GFLOPS
+aggregate is ~95% of the 8-core ceiling. No code change can exceed it;
+only less work or more power/clocks.
+
+## What worked (full-file int8, bf8 unless noted; baseline 41.02 s / 1.08x)
+
+- x86 int8 KV cache, per-token symmetric + fp32 accum (`--quant int8`
+  auto-enables on AVX2+FMA): QK 2.0x, PV 2.6x on the math; full file
+  ~41 -> ~34 s with the rest. Costs 0.3 dB total (24.82 -> 24.51 dB vs
+  fp32 on 5 s). With prescale fold in PV (+~7%).
+- Masked remainder batching (4+2 pattern): -33% KV traffic on bf6 tails.
+- Column-split AVX2 GEMM (weights 1x instead of 8x): neutral-to-positive;
+  kept for L3 pressure on full file. Falls back to row split for n/16 < threads.
+- Block size 8 as default (was 6): +12% vs bf6 (30.6 vs 34.2 s), quality
+  neutral-to-better (23.64 vs 23.16 dB vs matching fp32). bf12 (32.8 s) and
+  bf16 (33.9 s) are SLOWER — L3 thrashing past M~736 (pair rows2), so the
+  optimum is confirmed from both sides, not just picked.
+- x86 `kMinParallelOps` 2M -> 100k + parallel transpose/mamba-scalar/cat
+  loops + `sc.trans+=feat` -> add_par: LN 1.06->0.23 s, transpose/add down.
+- Scratch reserve-no-zero pattern (q8/q8s/bscores/bqkv/mamba_ext); removed
+  resizes of the never-read decay/h slabs; madvise(HUGEPAGE) on weight blob
+  + AVX2 panels.
+- Decode tails via padded `v_attn4_qk` (decode 0.24->0.15 s on 5 s).
+- Worker-side attn breakdown timers + FLOP counters (diagnostic, kept;
+  zero cost with --profile off).
+- Determinism proven (341.57 dB rerun); fp32 reference intact
+  (69.75 dB vs clean2.wav, was 69.71).
+
+## What did NOT work (measured, reverted or not taken)
+
+- GELU/softplus epilogue fusion into the AVX2 GEMM: net-zero/negative
+  (30.67 -> 30.90 s). Hand-rolled AVX2 erf (~25 uops/8) is slower than
+  xsimd's erf in the separate pass; moving ALU into the GEMM critical path
+  outweighed saved memory passes. Fully reverted (bit-identical: 338 dB).
+  Softplus fusion additionally showed ~2 dB quality cost (1e-6 seed
+  accumulates in scan state); GELU-only was clean but still net-zero. Lesson:
+  the elem pass is ALU-bound, not memory-bound.
+- Scan as 4 passes of 4 states: slower (more passes over L1-hot data beat
+  the spill saving). L1-resident spills are nearly free.
+- Integer PV via `maddubs`: wrong reduction (group sums, but PV needs
+  per-element outputs). Caught before running. Integer QK dot: offset
+  correction overhead negates the uop win.
+- Band int8 QK/PV: quantize overhead dwarfs the n=46 compute.
+- 2D GEMM tiling, QK/PV prefetch+unroll: streams are HW-prefetched, kernel
+  is uop-bound at peak already.
+- bf12/bf16 defaults: slower (L3 thrash), rejected; bf8 stays.
+- Masked band tail: score-buffer aliasing breaks softmax; negligible win.
+- Hadamard rotation for KV: unnecessary — plain per-token int8 holds
+  quality (0.3 dB cost).
+- `-march=native` PGO/fast-math, LTO, k-unrolling, 8-row tiles, 4/6/7
+  threads: no gain (prior sessions + re-verified where cheap).
+- Governor/performance+EPP: no effect under 8-core AVX (power-capped).
+
+Current best (this session, code as of now): 30.55-30.67 s full-file int8
+bf8 = **1.44-1.45x realtime** (user CPU ~229 s). Remaining gap to 1.9x
+(23.3 s) is ~7.3 s against a proven power wall: GEMM at ~95% of the 8-core
+ceiling, attention/scan/elem at their uop peaks. Only less work (model or
+measurement config) or more power/clocks can close it — both are decisions,
+not code.
+
+## Pool affinity bug (found 2026-11-20, fixed)
+
+`--threads 6` ran at ~1 core (full file 576 s, 5 s clip 63 s, user≈wall;
+attention sub-kernels looked normal, everything pool-parallel exploded).
+Root cause, proven by strace: the default pool is lazily built as Pool(8)
+and pins main+workers to cpus [0,2,...,14]. `set_default_pool_threads(6)`
+then constructs Pool(6), whose `one_cpu_per_core` probe sees only the
+pinned main-thread mask {0}, fails its `size == threads` check, skips
+pinning — and all 5 new workers inherit the {0} mask (return codes
+unchecked, no fallback). All threads time-share one core.
+Fix (`src/pool.cc`): capture the pre-pinning allowed set once; on size
+mismatch explicitly restore the full mask on main+workers instead of
+inheriting. Verified: threads-6 5 s clip 63.05 s -> 4.02 s (user 20.7,
+ratio 5.2x), SNR vs fp32 25.19 dB (quality-neutral), vs t8 29.89 dB
+(chunk-order seeds only), `vi_tests` green. t8 path untouched (early-return,
+same pinned-8 pool). Lesson: the threads-6 full-file number (576 s) was
+never a data point — thread-count tuning is closed, 8 stays (6 threads
+cannot beat 8 on wall: same user CPU over fewer cores).
+
+## Frequency-domain cropping: measured and rejected (2026-11-20)
+
+Hypothesis: for band-limited radio input (USB voice, nothing useful outside
+0.3–4 kHz) runtime band cropping could cut compute roughly in proportion to
+bands kept (B=23 → ~×0.53 work, B=19 → ~×0.45; band attention quadratic;
+FFT/OLA fixed). All 46 bands cost the same (width-512 rows per band), so the
+arithmetic was clean — if the model tolerated it.
+
+Zero-code A/B: brick-wall filter the INPUT at a band boundary, keeping float
+values bit-identical in the kept range (8-bit source re-encoded into 16-bit
+containers; `read_wav`'s 8-bit path is `(v−128)/128`, so values match
+exactly), run the full fp32 model (44.29 s, 8 threads, bf8, window 600/200),
+compare outputs against the unfiltered run.
+
+| arm: input removed | overall SNR vs full-input run | note |
+|---|---:|---|
+| control: no filtering, container only | bit-identical, max diff 0.0 | methodology + determinism validated |
+| >13.03 kHz (SDR noise floor only, −38 dB) | 3.4 dB | collapse |
+| >7.99 kHz | 4.3 dB | collapse |
+| >6.47 kHz | 3.6 dB | collapse |
+| >4.0 kHz | 4.2 dB | 0–3 kHz energy −9.2 dB vs −5.8 dB |
+| >3.07 kHz | ~2.6 dB | collapse |
+| <281 Hz (hum) | 2.0 dB | 0.3–3 kHz energy −11.0 dB |
+| keep only 281 Hz–3.07 kHz | 0.1 dB | near-silence (−28.2 dB) |
+
+Listening (operator): kept speech sounds clean, but the model mutes most
+borderline speech ("holes"). The collapse is FLAT across cutoffs: removing
+only the 13–24 kHz noise floor, or only the sub-300 Hz hum, produces the
+same conservative gating as removing everything. The whole spectrum is
+load-bearing: the model reads noise-only and hum-only regions as its
+speech/noise reference (per-band LayerNorm removes absolute level, so it is
+the *texture* of those regions that carries the evidence). This is likely
+why it gates so well on noisy radio and never hallucinates.
+
+Caveat: these arms zero the removed bands' input, so their features become
+degenerate constants inside band attention / freq mamba. A true runtime crop
+(bands absent from attention entirely, `--bands B`) is a different
+perturbation and was NOT implemented — with eight arms collapsing
+identically, the prior for the crop being clean is too low to spend the day.
+No retraining pipeline exists for this model, so a retrained narrow-band
+variant is not available either.
+
+Conclusion: frequency-domain compute reduction is CLOSED for this model
+without retraining. Remaining lever on this hardware: the streaming window
+architecture — restart+crossfade costs ×4/3 on all frame work; a sliding
+window without restarts is ~−25% wall, testable with zero code via
+`--window-frames 0 --cache-frames N`.
+
+Artifacts: `/tmp/opencode/ab_{orig,control,f13,f8,f6,filt,filt3,hp300,bp}.wav`
+and the filtered inputs
+`/tmp/opencode/{control16,lowpass*,highpass281,bandpass_281_3070}.wav`.
+
+## Sliding window: measured, operator-validated, adopted as default (2026-11-20)
+
+With frequency cropping closed (previous section), the restart+crossfade
+tax became the main remaining lever: lanes 600/200 recompute 200 of every
+600 frames → ×4/3 on all frame work. The alternative needs no code:
+`--window-frames 0` runs ONE continuous lane (mamba state never resets, KV
+trimmed by the existing compaction path) with `--cache-frames N`.
+
+Full 44.29 s file, 8 threads, bf8, arms run back to back (shared box, wall
+indicative):
+
+| arm | processing | realtime |
+|---|---:|---:|
+| fp32 restart 600/200 (old default) | 71.5 s | 0.62x |
+| fp32 sliding, cache 1200 | 58.98 s | 0.75x |
+| fp32 sliding, cache 600 | 54.08 s | 0.82x |
+| fp32 sliding, cache 400 | 51.68 s | 0.86x |
+| fp32 sliding, cache 300 | 50.55 s | 0.88x |
+| int8 restart 600/200 (old default) | 30.6 s | 1.44x |
+| **int8 sliding, cache 400** | **22.33 s** | **1.98x** |
+
+Quality diagnosis (sliding cache 400 vs restart): bit-identical for the
+first ~3 s, divergence begins exactly at the first lane boundary (restart
+starts its second lane at frame 400); no time shift (0.0 ms best alignment
+lag); the difference spectrum tracks the signal spectrum (−1.5 dB vs −1.2 dB
+share in the 0.3–1.5 kHz band) — different but legitimate denoising
+decisions, not added noise and not muting (0.3–3 kHz energy −4.7 dB vs
+restart's −5.6 dB). `clean2.wav` was produced with restart semantics, so
+sliding-vs-clean2 reads ~8 dB BY DESIGN and is not a gate (the restart
+reference itself matches clean2 at 69.7 dB).
+
+Operator listening verdict on the radio material: fp32 cache 400, fp32
+cache 300 and int8 cache 400 all satisfactory.
+
+Decision (operator-approved): sliding is the new default — `src/stream.h`
+now has `window_frames = 0`, `cache_frames = 400`; `--help` and
+README-intel.md updated. Restart mode remains reproducible via
+`--window-frames 600 --cache-frames 1200` (the configuration all historical
+quality gates were anchored on). The ×4/3 tax is platform-independent, so
+the same win is expected on the M4 Max (unmeasured there: int8 18.9 → ~14 s
+est., fp32 30.4 → ~23 s est.).
+
+Verification (running at the time of writing; results appended below):
+rebuild, `vi_tests . quick`, bit-identity of the new-default fp32 run
+against the validated `ab_sw400` arm, int8 determinism rerun plus bit-match
+against `ab_sw400_i8`, `ctest` for native and portable builds.

@@ -265,10 +265,24 @@ Pool::Pool(int threads) : impl_(new Impl), threads_(threads < 1 ? 1 : threads) {
 #if defined(__linux__) && (defined(__x86_64__) || defined(__i386__))
   const char* no_affinity = std::getenv("VI_NO_AFFINITY");
   if (threads_ > 1 && !(no_affinity && std::atoi(no_affinity))) {
+    // Process-wide mask before any Pool pinned it. The default pool is built
+    // lazily (8 threads, pinned) and `set_default_pool_threads(N)` then
+    // replaces it: the replacement's `one_cpu_per_core` would otherwise see
+    // only the pinned main-thread mask, fail its size check, skip pinning,
+    // and leave every new worker inheriting the single-CPU mask (~serial).
+    static const std::vector<int> original = [] {
+      cpu_set_t allowed;
+      CPU_ZERO(&allowed);
+      std::vector<int> out;
+      if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return out;
+      for (int c = 0; c < CPU_SETSIZE; ++c)
+        if (CPU_ISSET(c, &allowed)) out.push_back(c);
+      return out;
+    }();
     const std::vector<int> cpus = one_cpu_per_core(threads_);
+    cpu_set_t set;
+    CPU_ZERO(&set);
     if (static_cast<int>(cpus.size()) == threads_) {
-      cpu_set_t set;
-      CPU_ZERO(&set);
       CPU_SET(cpus[0], &set);
       sched_setaffinity(0, sizeof(set), &set);  // calling (main) thread
       for (int i = 1; i < threads_; ++i) {
@@ -277,6 +291,13 @@ Pool::Pool(int threads) : impl_(new Impl), threads_(threads < 1 ? 1 : threads) {
         pthread_setaffinity_np(impl_->threads[static_cast<size_t>(i - 1)].native_handle(),
                                sizeof(set), &set);
       }
+    } else if (!original.empty()) {
+      // Pinning not possible (e.g. replacement pool probing a pinned mask):
+      // restore the full mask so workers never inherit a single-CPU mask.
+      for (int c : original) CPU_SET(c, &set);
+      sched_setaffinity(0, sizeof(set), &set);
+      for (auto& t : impl_->threads)
+        pthread_setaffinity_np(t.native_handle(), sizeof(set), &set);
     }
   }
 #endif

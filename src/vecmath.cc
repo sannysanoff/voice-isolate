@@ -1755,6 +1755,14 @@ VI_SCAN_AVX2 void attn4_qk_i8_avx2(const float* q0, const float* q1,
                                    int n, int hd, float gscale, float* s0,
                                    float* s1, float* s2, float* s3) {
   for (int j = 0; j < n; ++j) {
+    // Stream keys once per batch: hint NTA so the single-use KV stream does
+    // not evict GEMM working sets from shared L3 (keys are re-read from DRAM
+    // on later blocks anyway once the window slides out of cache).
+    if ((j & 3) == 0 && j + 16 < n) {
+      _mm_prefetch(reinterpret_cast<const char*>(keys + static_cast<size_t>(j + 16) * hd),
+                   _MM_HINT_NTA);
+      _mm_prefetch(reinterpret_cast<const char*>(&kscales[j + 16]), _MM_HINT_NTA);
+    }
     const int8_t* kj = keys + static_cast<size_t>(j) * hd;
     const __m256 ksc = _mm256_broadcast_ss(&kscales[j]);
     __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
@@ -1808,6 +1816,11 @@ VI_SCAN_AVX2 void attn4_pv_i8_avx2(float* p0, float* p1, float* p2,
     __m256 a20 = _mm256_setzero_ps(), a21 = _mm256_setzero_ps();
     __m256 a30 = _mm256_setzero_ps(), a31 = _mm256_setzero_ps();
     for (int j = 0; j < n; ++j) {
+      if ((j & 7) == 0 && j + 32 < n) {
+        _mm_prefetch(reinterpret_cast<const char*>(vals + static_cast<size_t>(j + 32) * hd + d),
+                     _MM_HINT_NTA);
+        _mm_prefetch(reinterpret_cast<const char*>(&vscales[j + 32]), _MM_HINT_NTA);
+      }
       const int8_t* vj = vals + static_cast<size_t>(j) * hd + d;
       __m128i b16 = _mm_loadu_si128(
           reinterpret_cast<const __m128i*>(vj));

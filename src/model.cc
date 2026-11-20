@@ -70,6 +70,16 @@ constexpr int64_t kMinQuantOps = 16'000'000;
 
 inline bool worth_splitting(int64_t ops) { return ops >= kMinParallelOps; }
 
+// Reserve scratch capacity without zeroing. All scratch buffers are fully
+// written before use, so vector::resize()'s zeroing is pure overhead when
+// sizes oscillate (single/pair blocks, varying GEMM shapes): each growth
+// inside capacity memsets the delta. Callers use .data() with explicit
+// bounds and never rely on size().
+template <typename T>
+inline void reserve_scratch(std::vector<T>& v, size_t n) {
+  if (v.capacity() < n) v.reserve(n);
+}
+
 // How many channel ranges to carve each task into: enough to fill the pool,
 // but not so fine that the fixed cost per unit dominates.
 int channel_split(int tasks, int inner) {
@@ -967,8 +977,8 @@ void Model::linear_par_avx2(const float* a, int m, int k, int stride,
   }
   Scratch& sc = scratch(m);
   const size_t bytes = static_cast<size_t>(m) * k;
-  if (sc.q8.size() < bytes) sc.q8.resize(bytes);
-  if (sc.q8s.size() < static_cast<size_t>(m)) sc.q8s.resize(m);
+  reserve_scratch(sc.q8, bytes);
+  reserve_scratch(sc.q8s, static_cast<size_t>(m));
   auto* aq = reinterpret_cast<uint8_t*>(sc.q8.data());
   const int threads = default_pool().size();
   const int ntiles = n / 16;
@@ -1995,8 +2005,7 @@ void Model::band_transformer_core(const AttnWeights& w, float* trans,
   const int rows = bands * frames;
   const int units = frames * heads;
   Scratch& sc = scratch(rows);
-  if (sc.bscores.size() < static_cast<size_t>(bands) * bands * units)
-    sc.bscores.resize(static_cast<size_t>(bands) * bands * units);
+  reserve_scratch(sc.bscores, static_cast<size_t>(bands) * bands * units);
 
   layer_norm_par(trans, sc.norm.data(), rows, width, w.bn1w->data,
                  w.bn1b->data);
@@ -2005,7 +2014,7 @@ void Model::band_transformer_core(const AttnWeights& w, float* trans,
   const size_t per_unit = static_cast<size_t>(bands) * hd;
   {
     Timer slot(profile_enabled() ? &profile().transpose : nullptr);
-    if (sc.bqkv.size() < 3 * per_unit * units) sc.bqkv.resize(3 * per_unit * units);
+    reserve_scratch(sc.bqkv, 3 * per_unit * units);
     float* qall = sc.bqkv.data();
     float* kall = qall + per_unit * units;
     float* vall = kall + per_unit * units;
@@ -2209,8 +2218,8 @@ void Model::mamba_layer(const MambaLayer& l, const float* x, int rows, int len,
   }
 
   linear_par(sc.u2.data(), rows, inner, *l.x_w, nullptr, sc.xp.data());
-  linear_par(sc.xp.data(), rows, dt_rank, dt_total, *l.dt_w, l.dt_b->data,
-             sc.delta.data());
+  linear_par(sc.xp.data(), rows, dt_rank, dt_total,
+             *l.dt_w, l.dt_b->data, sc.delta.data());
   elementwise_par(sc.delta.data(), rows * inner, v_softplus, /*cost=*/10);
 
   {
@@ -2355,8 +2364,8 @@ void Model::mamba_layer_pair(const MambaLayer& l, const float* x, int rows_each,
   }
 
   linear_par(sc.u2.data(), rows, inner, *l.x_w, nullptr, sc.xp.data());
-  linear_par(sc.xp.data(), rows, dt_rank, dt_total, *l.dt_w, l.dt_b->data,
-             sc.delta.data());
+  linear_par(sc.xp.data(), rows, dt_rank, dt_total,
+             *l.dt_w, l.dt_b->data, sc.delta.data());
   elementwise_par(sc.delta.data(), rows * inner, v_softplus, /*cost=*/10);
 
   {
@@ -2421,7 +2430,6 @@ void Model::backbone(float* feat, int frames, Lane& lane, const Rope& rope,
   const int bands = cfg_.bands();
   const int width = cfg_.width;
   const int inner = cfg_.inner();
-  const int state = cfg_.mamba_state;
   const int taps = cfg_.mamba_conv - 1;
   const int rows = bands * frames;
   Scratch& sc = scratch(rows);
@@ -2429,11 +2437,7 @@ void Model::backbone(float* feat, int frames, Lane& lane, const Rope& rope,
   const size_t ext_need = std::max(
       static_cast<size_t>(bands) * (frames + taps) * inner,
       static_cast<size_t>(frames) * (bands + taps) * inner);
-  const size_t state_need =
-      static_cast<size_t>(std::max(bands, frames)) * state * inner;
-  if (sc.mamba_ext.size() < ext_need) sc.mamba_ext.resize(ext_need);
-  if (sc.mamba_decay.size() < state_need) sc.mamba_decay.resize(state_need);
-  if (sc.mamba_h.size() < state_need) sc.mamba_h.resize(state_need);
+  reserve_scratch(sc.mamba_ext, ext_need);
 
   std::vector<float> debug_in;
   if (debug_block) debug_in.resize(static_cast<size_t>(rows) * width);
@@ -2523,7 +2527,6 @@ void Model::backbone_pair(float* feat_a, float* feat_b, int frames,
   const int bands = cfg_.bands();
   const int width = cfg_.width;
   const int inner = cfg_.inner();
-  const int state = cfg_.mamba_state;
   const int taps = cfg_.mamba_conv - 1;
   const int rows = bands * frames;
   const int rows2 = 2 * rows;
@@ -2533,11 +2536,8 @@ void Model::backbone_pair(float* feat_a, float* feat_b, int frames,
   const size_t ext_need = std::max(
       static_cast<size_t>(2 * bands) * (frames + taps) * inner,
       static_cast<size_t>(frames2) * (bands + taps) * inner);
-  const size_t state_need =
-      static_cast<size_t>(std::max(2 * bands, frames2)) * state * inner;
-  if (sc.mamba_ext.size() < ext_need) sc.mamba_ext.resize(ext_need);
-  if (sc.mamba_decay.size() < state_need) sc.mamba_decay.resize(state_need);
-  if (sc.mamba_h.size() < state_need) sc.mamba_h.resize(state_need);
+  reserve_scratch(sc.mamba_ext, ext_need);
+  // NOTE: sc.mamba_decay / sc.mamba_h are legacy leftovers (never read).
   if (sc.pair.size() < static_cast<size_t>(rows2) * width)
     sc.pair.resize(static_cast<size_t>(rows2) * width);
 

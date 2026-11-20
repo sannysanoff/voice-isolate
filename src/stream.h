@@ -12,10 +12,10 @@
 namespace vi {
 
 struct StreamOptions {
-  int block_frames = 6;      // frames computed together; throughput only (x86: ~1.05-1.08x realtime int8)
-  int window_frames = 600;   // time-attention window; 0 = unbounded
-  int crossfade_frames = 200;
-  int cache_frames = 0;      // 0 = the checkpoint's attention window
+  int block_frames = 8;      // frames computed together; throughput only (x86: ~1.98x realtime int8)
+  int window_frames = 0;     // 0 = one continuous lane (sliding KV, no restarts); N = restart lanes every N frames
+  int crossfade_frames = 200;  // lane-boundary crossfade, used only when window_frames > 0
+  int cache_frames = 400;    // sliding-mode attention lookback; 0 = the checkpoint's window (1200)
 };
 
 // Streaming filter. `process` takes mono float samples at the model rate and
