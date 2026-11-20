@@ -8,6 +8,14 @@
 
 #include "vecmath.h"
 
+#ifdef VI_USE_OPENBLAS
+extern "C" {
+void cblas_sgemm(int, int, int, int, int, int, float, const float*, int,
+                 const float*, int, float, float*, int);
+void openblas_set_num_threads(int);
+}
+#endif
+
 namespace vi {
 
 Model::Profile& Model::profile() {
@@ -923,7 +931,15 @@ void Model::linear_par(const float* a, int m, int k, int stride, const Tensor& w
                                     n1 - n0, k);
     Eigen::Map<RowMajor, 0, Eigen::OuterStride<Eigen::Dynamic>> out(
         c + n0, m, n1 - n0, Eigen::OuterStride<Eigen::Dynamic>(n));
+#ifdef VI_USE_OPENBLAS
+    // The pool owns parallelism; prevent nested BLAS worker pools.
+    static const bool initialized = [] { openblas_set_num_threads(1); return true; }();
+    (void)initialized;
+    cblas_sgemm(101, 111, 112, m, n1 - n0, k, 1.0f, a, stride,
+                w.data + static_cast<size_t>(n0) * k, k, 0.0f, c + n0, n);
+#else
     out.noalias() = in * tile.transpose();
+#endif
     if (bias != nullptr) {
       Eigen::Map<const Eigen::Matrix<float, 1, Eigen::Dynamic>> b(bias + n0,
                                                                  n1 - n0);

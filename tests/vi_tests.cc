@@ -67,6 +67,39 @@ void expect(bool condition, const char* what) {
 
 // ------------------------------------------------------------------ tests ---
 
+void test_scan() {
+  std::printf("selective scan\n");
+  constexpr int inner = 12, state = 16, len = 7, rank = 3, total = rank + 2 * state;
+  std::vector<float> a(inner * state), h(inner * state), initial, u(len * inner),
+      delta(len * inner), z(len * 2 * inner), xp(len * total), d(inner), out(len * inner);
+  for (size_t i = 0; i < a.size(); ++i) { a[i] = -0.01f * (1 + i % 17); h[i] = 0.01f * (int(i % 11) - 5); }
+  for (size_t i = 0; i < u.size(); ++i) { u[i] = 0.03f * (int(i % 13) - 6); delta[i] = 0.02f * (1 + i % 9); }
+  for (size_t i = 0; i < z.size(); ++i) z[i] = 0.02f * (int(i % 19) - 9);
+  for (size_t i = 0; i < xp.size(); ++i) xp[i] = 0.03f * (int(i % 17) - 8);
+  for (int i = 0; i < inner; ++i) d[i] = 0.1f * (i - 5);
+  initial = h;
+  for (int carry = 0; carry < 2; ++carry) {
+    h = initial;
+    std::vector<float> refh = carry ? initial : std::vector<float>(initial.size(), 0.0f);
+    std::vector<float> expected(out.size(), -123.0f);
+    std::fill(out.begin(), out.end(), -123.0f);
+    for (int t = 0; t < len; ++t) for (int c = 4; c < inner; ++c) {
+      const float uc = u[t*inner+c], dc = delta[t*inner+c];
+      float sum = d[c] * uc;
+      for (int n = 0; n < state; ++n) {
+        const int idx = (c / 4) * state * 4 + n * 4 + c % 4;
+        refh[idx] = std::exp(a[idx] * 0.6931471805599453f * dc) * refh[idx] + dc * uc * xp[t*total+rank+n];
+        sum += refh[idx] * xp[t*total+rank+state+n];
+      }
+      float v = z[t*2*inner+inner+c];
+      expected[t*inner+c] = sum * v / (1.0f + std::exp(-v));
+    }
+    vi::v_mamba_scan(carry ? h.data() : nullptr, a.data(), d.data(), u.data(), delta.data(), z.data(), xp.data(), out.data(), len, inner, state, rank, total, 4, inner);
+    expect(compare(out.data(), expected.data(), out.size()).max_abs < 2e-6, carry ? "scan with carried state and channel slice" : "scan with zero state and channel slice");
+    if (carry) expect(compare(h.data(), refh.data(), h.size()).max_abs < 2e-6, "scan updates carried state");
+  }
+}
+
 void test_fft() {
   std::printf("fft\n");
   vi::Fft fft(2048);
@@ -309,6 +342,7 @@ void check_stream(const std::string& root, const std::string& dir,
 int main(int argc, char** argv) {
   const std::string root = argc > 1 ? argv[1] : ".";
   test_fft();
+  test_scan();
   test_vector_math();
   const bool quick = argc > 2 && std::string(argv[2]) == "quick";
   test_reference(root);

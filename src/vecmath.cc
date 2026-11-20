@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
@@ -453,6 +454,39 @@ void v_mamba_scan(float* __restrict h4, const float* __restrict a_log2e4,
         vst1q_f32(hp + 40, h2);  vst1q_f32(hp + 44, h3);
         vst1q_f32(hp + 48, h4v); vst1q_f32(hp + 52, h5);
         vst1q_f32(hp + 56, h6);  vst1q_f32(hp + 60, h7);
+      }
+    }
+    return;
+  }
+#endif
+#if defined(__SSE2__) && !VI_HAS_NEON
+  // The checkpoint stores four adjacent channels together in each state.
+  // SSE matches that layout and evaluates four independent recurrences at once.
+  if (c0 % 4 == 0 && c1 % 4 == 0) {
+    using B = xsimd::batch<float, xsimd::sse2>;
+    constexpr float ln2 = 0.6931471805599453f;
+    std::vector<float> local(h4 ? 0 : static_cast<size_t>(state) * 4);
+    for (int c = c0; c < c1; c += 4) {
+      const size_t offset = static_cast<size_t>(c / 4) * state * 4;
+      const float* ap = a_log2e4 + offset;
+      if (!h4) std::fill(local.begin(), local.end(), 0.0f);
+      float* hp = h4 ? h4 + offset : local.data();
+      for (int t = 0; t < len; ++t) {
+        const size_t pos = static_cast<size_t>(t) * inner + c;
+        const B vu = B::load_unaligned(u + pos);
+        const B vd = B::load_unaligned(delta + pos);
+        const B du = vd * vu;
+        const float* bv = xp + static_cast<size_t>(t) * dt_total + dt_rank;
+        const float* cv = bv + state;
+        B acc = B::load_unaligned(d_skip + c) * vu;
+        for (int n = 0; n < state; ++n) {
+          B h = xsimd::exp(B::load_unaligned(ap + 4*n) * vd * B(ln2)) *
+                    B::load_unaligned(hp + 4*n) + du * B(bv[n]);
+          h.store_unaligned(hp + 4*n);
+          acc = acc + h * B(cv[n]);
+        }
+        const B vz = B::load_unaligned(z + static_cast<size_t>(t) * 2 * inner + inner + c);
+        (acc * vz / (B(1.0f) + xsimd::exp(-vz))).store_unaligned(y + pos);
       }
     }
     return;
