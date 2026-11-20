@@ -1,21 +1,32 @@
 # x86-64 build and four-frame streaming
 
-On Linux with CMake, a C++17 compiler and pthreads:
+Install the dependencies described in [README.md](README.md), then build:
 
 ```sh
 cmake -S . -B build-intel
 cmake --build build-intel -j
-./build-intel/voice-isolate-cli input.wav output-intel.wav model
+./build-intel/voice-isolate-cli input.wav output-intel.wav --threads 8
 ```
 
-The model directory defaults to `model` relative to the current directory. The
-input must have the model's sample rate (48 kHz); channels are averaged to mono.
-The output is mono 16-bit PCM. Processing uses the streaming defaults: four
-frames per block, a 600-frame window, and a 200-frame crossfade. The executable
-reads the input in chunks and flushes the stream at the end.
+The normal build uses Eigen for matrix multiplication. An optional OpenBLAS
+library can be selected by passing its full path at configure time, for example:
 
-By default `VI_NATIVE=ON` tunes the build for the machine compiling it. For a
-binary intended for other x86-64 machines, configure with `-DVI_NATIVE=OFF`.
-The ARM SME2 and dot-product kernels are disabled on x86; the fp32 path is used.
-Run `ctest --test-dir build-intel --output-on-failure` for the available tests.
-Some reference tests are skipped if the optional `ref/` data is absent.
+```sh
+cmake -S . -B build-intel -DVI_OPENBLAS_LIBRARY=/path/to/libopenblas.so
+cmake --build build-intel -j
+./build-intel/voice-isolate-cli input.wav output-intel.wav --threads 8 --profile
+```
+
+OpenBLAS is restricted to one thread per call; the existing worker pool divides
+matrix work across the selected threads. This changes the OpenBLAS thread setting
+process-wide. The ARM SME2 kernels retain priority when available.
+
+The default streaming configuration uses four frames per block, a 600-frame
+window and a 200-frame crossfade. See `--help` for the filter mode and options.
+The input sample rate must match the model (48 kHz); channels are averaged to
+mono. The model directory defaults to `model` relative to the current directory.
+
+`VI_NATIVE=ON` tunes the build for the build machine; use `-DVI_NATIVE=OFF` for
+an x86-64 binary intended for other machines. Run
+`ctest --test-dir build-intel --output-on-failure` for available tests; reference
+tests are skipped when the optional `ref/` data is absent.

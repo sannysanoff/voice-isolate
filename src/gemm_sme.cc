@@ -489,7 +489,27 @@ void gemm_f16_cols_impl(const uint16_t* __restrict ap_u,
       } else {
         svzero_za();
       }
-      for (int kk = 0; kk < k2; ++kk) {
+      int kk = 0;
+      for (; kk + 1 < k2; kk += 2) {
+        svfloat16_t va0 = svld1_f16(pg16, a0 + kk * 32);
+        svfloat16_t va1 = svld1_f16(pg16, a1 + kk * 32);
+        svfloat16_t vb0 = svld1_f16(pg16, b0 + kk * 32);
+        svfloat16_t vb1 = svld1_f16(pg16, b1 + kk * 32);
+        svmopa_za32_f16_m(0, pg16, pg16, va0, vb0);
+        svmopa_za32_f16_m(1, pg16, pg16, va0, vb1);
+        svmopa_za32_f16_m(2, pg16, pg16, va1, vb0);
+        svmopa_za32_f16_m(3, pg16, pg16, va1, vb1);
+
+        va0 = svld1_f16(pg16, a0 + (kk + 1) * 32);
+        va1 = svld1_f16(pg16, a1 + (kk + 1) * 32);
+        vb0 = svld1_f16(pg16, b0 + (kk + 1) * 32);
+        vb1 = svld1_f16(pg16, b1 + (kk + 1) * 32);
+        svmopa_za32_f16_m(0, pg16, pg16, va0, vb0);
+        svmopa_za32_f16_m(1, pg16, pg16, va0, vb1);
+        svmopa_za32_f16_m(2, pg16, pg16, va1, vb0);
+        svmopa_za32_f16_m(3, pg16, pg16, va1, vb1);
+      }
+      for (; kk < k2; ++kk) {
         svfloat16_t va0 = svld1_f16(pg16, a0 + kk * 32);
         svfloat16_t va1 = svld1_f16(pg16, a1 + kk * 32);
         svfloat16_t vb0 = svld1_f16(pg16, b0 + kk * 32);
@@ -722,7 +742,27 @@ void gemm_i8_cols_impl(const int8_t* __restrict ap, const float* __restrict as,
       const int8_t* b0 = bp + static_cast<size_t>(n / 16) * k4 * 64;
       const int8_t* b1 = bp + static_cast<size_t>(n / 16 + 1) * k4 * 64;
       svzero_za();
-      for (int kk = 0; kk < k4; ++kk) {
+      int kk = 0;
+      for (; kk + 1 < k4; kk += 2) {
+        svint8_t va0 = svld1_s8(pg8, a0 + kk * 64);
+        svint8_t va1 = svld1_s8(pg8, a1 + kk * 64);
+        svint8_t vb0 = svld1_s8(pg8, b0 + kk * 64);
+        svint8_t vb1 = svld1_s8(pg8, b1 + kk * 64);
+        svmopa_za32_s8_m(0, pg8, pg8, va0, vb0);
+        svmopa_za32_s8_m(1, pg8, pg8, va0, vb1);
+        svmopa_za32_s8_m(2, pg8, pg8, va1, vb0);
+        svmopa_za32_s8_m(3, pg8, pg8, va1, vb1);
+
+        va0 = svld1_s8(pg8, a0 + (kk + 1) * 64);
+        va1 = svld1_s8(pg8, a1 + (kk + 1) * 64);
+        vb0 = svld1_s8(pg8, b0 + (kk + 1) * 64);
+        vb1 = svld1_s8(pg8, b1 + (kk + 1) * 64);
+        svmopa_za32_s8_m(0, pg8, pg8, va0, vb0);
+        svmopa_za32_s8_m(1, pg8, pg8, va0, vb1);
+        svmopa_za32_s8_m(2, pg8, pg8, va1, vb0);
+        svmopa_za32_s8_m(3, pg8, pg8, va1, vb1);
+      }
+      for (; kk < k4; ++kk) {
         svint8_t va0 = svld1_s8(pg8, a0 + kk * 64);
         svint8_t va1 = svld1_s8(pg8, a1 + kk * 64);
         svint8_t vb0 = svld1_s8(pg8, b0 + kk * 64);
@@ -817,7 +857,56 @@ void gemm_i8_cols_impl(const int8_t* __restrict ap, const float* __restrict as,
   if (row < m) {
     const int mr = m - row;
     const int8_t* a0 = ap + static_cast<size_t>(row / 16) * k4 * 64;
-    for (int n = n0; n < n1; n += 16) {
+    int n = n0;
+    for (; n + 64 <= n1; n += 64) {
+      const int8_t* b0 = bp + static_cast<size_t>(n / 16) * k4 * 64;
+      const int8_t* b1 = bp + static_cast<size_t>(n / 16 + 1) * k4 * 64;
+      const int8_t* b2 = bp + static_cast<size_t>(n / 16 + 2) * k4 * 64;
+      const int8_t* b3 = bp + static_cast<size_t>(n / 16 + 3) * k4 * 64;
+      svzero_za();
+      for (int kk = 0; kk < k4; ++kk) {
+        svint8_t va = svld1_s8(pg8, a0 + kk * 64);
+        svmopa_za32_s8_m(0, pg8, pg8, va, svld1_s8(pg8, b0 + kk * 64));
+        svmopa_za32_s8_m(1, pg8, pg8, va, svld1_s8(pg8, b1 + kk * 64));
+        svmopa_za32_s8_m(2, pg8, pg8, va, svld1_s8(pg8, b2 + kk * 64));
+        svmopa_za32_s8_m(3, pg8, pg8, va, svld1_s8(pg8, b3 + kk * 64));
+      }
+      svfloat32_t vws0 = svld1_f32(pg32, ws + n);
+      svfloat32_t vws1 = svld1_f32(pg32, ws + n + 16);
+      svfloat32_t vws2 = svld1_f32(pg32, ws + n + 32);
+      svfloat32_t vws3 = svld1_f32(pg32, ws + n + 48);
+      svfloat32_t vb0 = bias ? svld1_f32(pg32, bias + n) : svdup_f32(0.0f);
+      svfloat32_t vb1 = bias ? svld1_f32(pg32, bias + n + 16) : svdup_f32(0.0f);
+      svfloat32_t vb2 = bias ? svld1_f32(pg32, bias + n + 32) : svdup_f32(0.0f);
+      svfloat32_t vb3 = bias ? svld1_f32(pg32, bias + n + 48) : svdup_f32(0.0f);
+      for (int r = 0; r < mr; r += 4) {
+        svint32x4_t q0 = svread_hor_za32_s32_vg4(0, r);
+        svint32x4_t q1 = svread_hor_za32_s32_vg4(1, r);
+        svint32x4_t q2 = svread_hor_za32_s32_vg4(2, r);
+        svint32x4_t q3 = svread_hor_za32_s32_vg4(3, r);
+        for (int u = 0; u < 4 && r + u < mr; ++u) {
+          svfloat32_t vas = svdup_f32(as[row + r + u]);
+          svint32_t z0 = (u == 0) ? svget4_s32(q0, 0) : (u == 1) ? svget4_s32(q0, 1)
+                       : (u == 2) ? svget4_s32(q0, 2) : svget4_s32(q0, 3);
+          svint32_t z1 = (u == 0) ? svget4_s32(q1, 0) : (u == 1) ? svget4_s32(q1, 1)
+                       : (u == 2) ? svget4_s32(q1, 2) : svget4_s32(q1, 3);
+          svint32_t z2 = (u == 0) ? svget4_s32(q2, 0) : (u == 1) ? svget4_s32(q2, 1)
+                       : (u == 2) ? svget4_s32(q2, 2) : svget4_s32(q2, 3);
+          svint32_t z3 = (u == 0) ? svget4_s32(q3, 0) : (u == 1) ? svget4_s32(q3, 1)
+                       : (u == 2) ? svget4_s32(q3, 2) : svget4_s32(q3, 3);
+          float* out = c + static_cast<size_t>(row + r + u) * ldc + n;
+          svst1_f32(pg32, out,
+                    svmla_f32_x(pg32, vb0, svmul_f32_x(pg32, svcvt_f32_s32_x(pg32, z0), vas), vws0));
+          svst1_f32(pg32, out + 16,
+                    svmla_f32_x(pg32, vb1, svmul_f32_x(pg32, svcvt_f32_s32_x(pg32, z1), vas), vws1));
+          svst1_f32(pg32, out + 32,
+                    svmla_f32_x(pg32, vb2, svmul_f32_x(pg32, svcvt_f32_s32_x(pg32, z2), vas), vws2));
+          svst1_f32(pg32, out + 48,
+                    svmla_f32_x(pg32, vb3, svmul_f32_x(pg32, svcvt_f32_s32_x(pg32, z3), vas), vws3));
+        }
+      }
+    }
+    for (; n < n1; n += 16) {
       const svbool_t pgn = svwhilelt_b32(n, n1);
       const int8_t* b0 = bp + static_cast<size_t>(n / 16) * k4 * 64;
       svzero_za();

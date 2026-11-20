@@ -465,10 +465,11 @@ void v_mamba_scan(float* __restrict h4, const float* __restrict a_log2e4,
   if (c0 % 4 == 0 && c1 % 4 == 0) {
     using B = xsimd::batch<float, xsimd::sse2>;
     constexpr float ln2 = 0.6931471805599453f;
+    std::vector<float> local(h4 ? 0 : static_cast<size_t>(state) * 4);
     for (int c = c0; c < c1; c += 4) {
       const size_t offset = static_cast<size_t>(c / 4) * state * 4;
       const float* ap = a_log2e4 + offset;
-      std::vector<float> local(h4 ? 0 : static_cast<size_t>(state) * 4, 0.0f);
+      if (!h4) std::fill(local.begin(), local.end(), 0.0f);
       float* hp = h4 ? h4 + offset : local.data();
       for (int t = 0; t < len; ++t) {
         const size_t pos = static_cast<size_t>(t) * inner + c;
@@ -1226,6 +1227,230 @@ void v_quant_pack_a_i8_block(const float* __restrict a, int m0, int mr, int k,
       for (int rr = mr; rr < 16; ++rr)
         dst32[static_cast<size_t>(kk4) * 16 + rr] = 0;
   }
+#endif
+}
+
+void v_pack_a_f32_block(const float* __restrict a, int m0, int mr, int k,
+                        int lda, float* __restrict ap_block) {
+#if VI_HAS_NEON
+  int r = 0;
+  for (; r + 4 <= mr; r += 4) {
+    const float* p0 = a + static_cast<size_t>(m0 + r + 0) * lda;
+    const float* p1 = a + static_cast<size_t>(m0 + r + 1) * lda;
+    const float* p2 = a + static_cast<size_t>(m0 + r + 2) * lda;
+    const float* p3 = a + static_cast<size_t>(m0 + r + 3) * lda;
+    int kk = 0;
+    for (; kk + 4 <= k; kk += 4) {
+      const float32x4_t u0 = vld1q_f32(p0 + kk);
+      const float32x4_t u1 = vld1q_f32(p1 + kk);
+      const float32x4_t u2 = vld1q_f32(p2 + kk);
+      const float32x4_t u3 = vld1q_f32(p3 + kk);
+      const float32x4_t a0 = vtrn1q_f32(u0, u1);
+      const float32x4_t a1 = vtrn2q_f32(u0, u1);
+      const float32x4_t a2 = vtrn1q_f32(u2, u3);
+      const float32x4_t a3 = vtrn2q_f32(u2, u3);
+      const float32x4_t t0 = vreinterpretq_f32_f64(
+          vtrn1q_f64(vreinterpretq_f64_f32(a0), vreinterpretq_f64_f32(a2)));
+      const float32x4_t t1 = vreinterpretq_f32_f64(
+          vtrn1q_f64(vreinterpretq_f64_f32(a1), vreinterpretq_f64_f32(a3)));
+      const float32x4_t t2 = vreinterpretq_f32_f64(
+          vtrn2q_f64(vreinterpretq_f64_f32(a0), vreinterpretq_f64_f32(a2)));
+      const float32x4_t t3 = vreinterpretq_f32_f64(
+          vtrn2q_f64(vreinterpretq_f64_f32(a1), vreinterpretq_f64_f32(a3)));
+      vst1q_f32(ap_block + static_cast<size_t>(kk + 0) * 16 + r, t0);
+      vst1q_f32(ap_block + static_cast<size_t>(kk + 1) * 16 + r, t1);
+      vst1q_f32(ap_block + static_cast<size_t>(kk + 2) * 16 + r, t2);
+      vst1q_f32(ap_block + static_cast<size_t>(kk + 3) * 16 + r, t3);
+    }
+    for (; kk < k; ++kk) {
+      ap_block[static_cast<size_t>(kk) * 16 + r + 0] = p0[kk];
+      ap_block[static_cast<size_t>(kk) * 16 + r + 1] = p1[kk];
+      ap_block[static_cast<size_t>(kk) * 16 + r + 2] = p2[kk];
+      ap_block[static_cast<size_t>(kk) * 16 + r + 3] = p3[kk];
+    }
+  }
+  for (; r < mr; ++r) {
+    const float* pr = a + static_cast<size_t>(m0 + r) * lda;
+    for (int kk = 0; kk < k; ++kk)
+      ap_block[static_cast<size_t>(kk) * 16 + r] = pr[kk];
+  }
+  if (mr < 16) {
+    for (int kk = 0; kk < k; ++kk)
+      for (int rr = mr; rr < 16; ++rr)
+        ap_block[static_cast<size_t>(kk) * 16 + rr] = 0.0f;
+  }
+#else
+  for (int r = 0; r < mr; ++r) {
+    const float* pr = a + static_cast<size_t>(m0 + r) * lda;
+    for (int kk = 0; kk < k; ++kk)
+      ap_block[static_cast<size_t>(kk) * 16 + r] = pr[kk];
+  }
+  if (mr < 16) {
+    for (int kk = 0; kk < k; ++kk)
+      for (int rr = mr; rr < 16; ++rr)
+        ap_block[static_cast<size_t>(kk) * 16 + rr] = 0.0f;
+  }
+#endif
+}
+
+void v_pack_a_f16_block(const float* __restrict a, int m0, int mr, int k,
+                        int lda, uint16_t* __restrict ap_block) {
+  uint32_t* dst32 = reinterpret_cast<uint32_t*>(ap_block);
+  const int k2 = k / 2;
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+  auto cvt8 = [](const float* p) -> uint32x4_t {
+    const float16x4_t lo = vcvt_f16_f32(vld1q_f32(p));
+    const float16x4_t hi = vcvt_f16_f32(vld1q_f32(p + 4));
+    return vreinterpretq_u32_f16(vcombine_f16(lo, hi));
+  };
+  int r = 0;
+  for (; r + 4 <= mr; r += 4) {
+    const float* p0 = a + static_cast<size_t>(m0 + r + 0) * lda;
+    const float* p1 = a + static_cast<size_t>(m0 + r + 1) * lda;
+    const float* p2 = a + static_cast<size_t>(m0 + r + 2) * lda;
+    const float* p3 = a + static_cast<size_t>(m0 + r + 3) * lda;
+    int kk = 0;
+    for (; kk + 8 <= k; kk += 8) {
+      const uint32x4_t u0 = cvt8(p0 + kk);
+      const uint32x4_t u1 = cvt8(p1 + kk);
+      const uint32x4_t u2 = cvt8(p2 + kk);
+      const uint32x4_t u3 = cvt8(p3 + kk);
+      const uint32x4_t a0 = vtrn1q_u32(u0, u1);
+      const uint32x4_t a1 = vtrn2q_u32(u0, u1);
+      const uint32x4_t a2 = vtrn1q_u32(u2, u3);
+      const uint32x4_t a3 = vtrn2q_u32(u2, u3);
+      const uint32x4_t t0 = vreinterpretq_u32_u64(
+          vtrn1q_u64(vreinterpretq_u64_u32(a0), vreinterpretq_u64_u32(a2)));
+      const uint32x4_t t1 = vreinterpretq_u32_u64(
+          vtrn1q_u64(vreinterpretq_u64_u32(a1), vreinterpretq_u64_u32(a3)));
+      const uint32x4_t t2 = vreinterpretq_u32_u64(
+          vtrn2q_u64(vreinterpretq_u64_u32(a0), vreinterpretq_u64_u32(a2)));
+      const uint32x4_t t3 = vreinterpretq_u32_u64(
+          vtrn2q_u64(vreinterpretq_u64_u32(a1), vreinterpretq_u64_u32(a3)));
+      const int kk2 = kk / 2;
+      vst1q_u32(dst32 + static_cast<size_t>(kk2 + 0) * 16 + r, t0);
+      vst1q_u32(dst32 + static_cast<size_t>(kk2 + 1) * 16 + r, t1);
+      vst1q_u32(dst32 + static_cast<size_t>(kk2 + 2) * 16 + r, t2);
+      vst1q_u32(dst32 + static_cast<size_t>(kk2 + 3) * 16 + r, t3);
+    }
+    for (; kk < k; kk += 2) {
+      const int kk2 = kk / 2;
+      __fp16* d = reinterpret_cast<__fp16*>(ap_block);
+      d[(static_cast<size_t>(kk2) * 16 + r + 0) * 2 + 0] = static_cast<__fp16>(p0[kk]);
+      d[(static_cast<size_t>(kk2) * 16 + r + 0) * 2 + 1] = static_cast<__fp16>(p0[kk + 1]);
+      d[(static_cast<size_t>(kk2) * 16 + r + 1) * 2 + 0] = static_cast<__fp16>(p1[kk]);
+      d[(static_cast<size_t>(kk2) * 16 + r + 1) * 2 + 1] = static_cast<__fp16>(p1[kk + 1]);
+      d[(static_cast<size_t>(kk2) * 16 + r + 2) * 2 + 0] = static_cast<__fp16>(p2[kk]);
+      d[(static_cast<size_t>(kk2) * 16 + r + 2) * 2 + 1] = static_cast<__fp16>(p2[kk + 1]);
+      d[(static_cast<size_t>(kk2) * 16 + r + 3) * 2 + 0] = static_cast<__fp16>(p3[kk]);
+      d[(static_cast<size_t>(kk2) * 16 + r + 3) * 2 + 1] = static_cast<__fp16>(p3[kk + 1]);
+    }
+  }
+  for (; r < mr; ++r) {
+    const float* pr = a + static_cast<size_t>(m0 + r) * lda;
+    int kk = 0;
+    for (; kk + 8 <= k; kk += 8) {
+      const uint32x4_t u = cvt8(pr + kk);
+      const int kk2 = kk / 2;
+      dst32[static_cast<size_t>(kk2 + 0) * 16 + r] = vgetq_lane_u32(u, 0);
+      dst32[static_cast<size_t>(kk2 + 1) * 16 + r] = vgetq_lane_u32(u, 1);
+      dst32[static_cast<size_t>(kk2 + 2) * 16 + r] = vgetq_lane_u32(u, 2);
+      dst32[static_cast<size_t>(kk2 + 3) * 16 + r] = vgetq_lane_u32(u, 3);
+    }
+    __fp16* d = reinterpret_cast<__fp16*>(ap_block);
+    for (; kk < k; kk += 2) {
+      const int kk2 = kk / 2;
+      d[(static_cast<size_t>(kk2) * 16 + r) * 2 + 0] = static_cast<__fp16>(pr[kk]);
+      d[(static_cast<size_t>(kk2) * 16 + r) * 2 + 1] = static_cast<__fp16>(pr[kk + 1]);
+    }
+  }
+  if (mr < 16) {
+    for (int kk2 = 0; kk2 < k2; ++kk2)
+      for (int rr = mr; rr < 16; ++rr)
+        dst32[static_cast<size_t>(kk2) * 16 + rr] = 0;
+  }
+#else
+  (void)a; (void)m0; (void)mr; (void)k; (void)lda; (void)dst32; (void)k2;
+#endif
+}
+
+void v_pack_a_bf16_block(const float* __restrict a, int m0, int mr, int k,
+                         int lda, uint16_t* __restrict ap_block) {
+  uint32_t* dst32 = reinterpret_cast<uint32_t*>(ap_block);
+  const int k2 = k / 2;
+#if VI_HAS_NEON
+  const uint32x4_t vbias = vdupq_n_u32(0x7FFFu);
+  const uint32x4_t vone = vdupq_n_u32(1u);
+  auto cvt8_bf16 = [&](const float* p) -> uint32x4_t {
+    const uint32x4_t u0 = vreinterpretq_u32_f32(vld1q_f32(p));
+    const uint32x4_t u1 = vreinterpretq_u32_f32(vld1q_f32(p + 4));
+    const uint32x4_t r0 = vaddq_u32(u0, vaddq_u32(vbias, vandq_u32(vshrq_n_u32(u0, 16), vone)));
+    const uint32x4_t r1 = vaddq_u32(u1, vaddq_u32(vbias, vandq_u32(vshrq_n_u32(u1, 16), vone)));
+    return vreinterpretq_u32_u16(vcombine_u16(vshrn_n_u32(r0, 16), vshrn_n_u32(r1, 16)));
+  };
+  int r = 0;
+  for (; r + 4 <= mr; r += 4) {
+    const float* p0 = a + static_cast<size_t>(m0 + r + 0) * lda;
+    const float* p1 = a + static_cast<size_t>(m0 + r + 1) * lda;
+    const float* p2 = a + static_cast<size_t>(m0 + r + 2) * lda;
+    const float* p3 = a + static_cast<size_t>(m0 + r + 3) * lda;
+    int kk = 0;
+    for (; kk + 8 <= k; kk += 8) {
+      const uint32x4_t u0 = cvt8_bf16(p0 + kk);
+      const uint32x4_t u1 = cvt8_bf16(p1 + kk);
+      const uint32x4_t u2 = cvt8_bf16(p2 + kk);
+      const uint32x4_t u3 = cvt8_bf16(p3 + kk);
+      const uint32x4_t a0 = vtrn1q_u32(u0, u1);
+      const uint32x4_t a1 = vtrn2q_u32(u0, u1);
+      const uint32x4_t a2 = vtrn1q_u32(u2, u3);
+      const uint32x4_t a3 = vtrn2q_u32(u2, u3);
+      const uint32x4_t t0 = vreinterpretq_u32_u64(
+          vtrn1q_u64(vreinterpretq_u64_u32(a0), vreinterpretq_u64_u32(a2)));
+      const uint32x4_t t1 = vreinterpretq_u32_u64(
+          vtrn1q_u64(vreinterpretq_u64_u32(a1), vreinterpretq_u64_u32(a3)));
+      const uint32x4_t t2 = vreinterpretq_u32_u64(
+          vtrn2q_u64(vreinterpretq_u64_u32(a0), vreinterpretq_u64_u32(a2)));
+      const uint32x4_t t3 = vreinterpretq_u32_u64(
+          vtrn2q_u64(vreinterpretq_u64_u32(a1), vreinterpretq_u64_u32(a3)));
+      const int kk2 = kk / 2;
+      vst1q_u32(dst32 + static_cast<size_t>(kk2 + 0) * 16 + r, t0);
+      vst1q_u32(dst32 + static_cast<size_t>(kk2 + 1) * 16 + r, t1);
+      vst1q_u32(dst32 + static_cast<size_t>(kk2 + 2) * 16 + r, t2);
+      vst1q_u32(dst32 + static_cast<size_t>(kk2 + 3) * 16 + r, t3);
+    }
+    for (; kk < k; kk += 2) {
+      const int kk2 = kk / 2;
+      const float* ps[4] = {p0, p1, p2, p3};
+      for (int u = 0; u < 4; ++u) {
+        uint32_t x0, x1;
+        std::memcpy(&x0, ps[u] + kk, 4);
+        std::memcpy(&x1, ps[u] + kk + 1, 4);
+        x0 += 0x7FFFu + ((x0 >> 16) & 1u);
+        x1 += 0x7FFFu + ((x1 >> 16) & 1u);
+        ap_block[(static_cast<size_t>(kk2) * 16 + r + u) * 2 + 0] = static_cast<uint16_t>(x0 >> 16);
+        ap_block[(static_cast<size_t>(kk2) * 16 + r + u) * 2 + 1] = static_cast<uint16_t>(x1 >> 16);
+      }
+    }
+  }
+  for (; r < mr; ++r) {
+    const float* pr = a + static_cast<size_t>(m0 + r) * lda;
+    for (int kk = 0; kk < k; kk += 2) {
+      uint32_t x0, x1;
+      std::memcpy(&x0, pr + kk, 4);
+      std::memcpy(&x1, pr + kk + 1, 4);
+      x0 += 0x7FFFu + ((x0 >> 16) & 1u);
+      x1 += 0x7FFFu + ((x1 >> 16) & 1u);
+      ap_block[(static_cast<size_t>(kk / 2) * 16 + r) * 2 + 0] = static_cast<uint16_t>(x0 >> 16);
+      ap_block[(static_cast<size_t>(kk / 2) * 16 + r) * 2 + 1] = static_cast<uint16_t>(x1 >> 16);
+    }
+  }
+  if (mr < 16) {
+    for (int kk2 = 0; kk2 < k2; ++kk2)
+      for (int rr = mr; rr < 16; ++rr)
+        dst32[static_cast<size_t>(kk2) * 16 + rr] = 0;
+  }
+#else
+  (void)a; (void)m0; (void)mr; (void)k; (void)lda; (void)dst32; (void)k2;
 #endif
 }
 

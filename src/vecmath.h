@@ -90,8 +90,17 @@ void v_attn4_pv(const float* p0, const float* p1, const float* p2,
 void v_linear_4rows(const float* a, int k, const float* w, int n,
                     const float* bias, float* c);
 
-// Multi-core friendly NEON quantize + SME2 pack of one 16-row block [m0, m0+mr)
-// from A[m, k] (stride lda) into ap_block[k/4][16][4] and scales[m0..m0+mr-1].
+// Multi-core friendly NEON pack of one 16-row block [m0, m0+mr) from A[m, k]
+// (stride lda) into SME2 panel layouts:
+// - f32: ap_block[k][16]
+// - f16/bf16: ap_block[k/2][16][2]
+// - i8: ap_block[k/4][16][4] + scales[m0..m0+mr-1]
+void v_pack_a_f32_block(const float* a, int m0, int mr, int k, int lda,
+                        float* ap_block);
+void v_pack_a_f16_block(const float* a, int m0, int mr, int k, int lda,
+                        uint16_t* ap_block);
+void v_pack_a_bf16_block(const float* a, int m0, int mr, int k, int lda,
+                         uint16_t* ap_block);
 void v_quant_pack_a_i8_block(const float* a, int m0, int mr, int k, int lda,
                              int8_t* ap_block, float* scales);
 
