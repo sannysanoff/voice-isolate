@@ -1101,3 +1101,34 @@ the older 44 s file; this material is harder, and the per-frame split is
 unchanged in character). Sliding default vs restart 600/1200 diverges by
 **7.0 dB by design** from the first lane boundary — the restart arm was run only
 as a sanity check and is not the deliverable.
+
+### Python reference for the new recording, 2026-11-20 14:41 CET
+
+Ran the installed package (`.venv/bin/voice-isolate`, offline mode, its default
+checkpoint `voice-isolator-v1`, MPS) to produce the ground truth for the same
+25.16 s input:
+
+```
+voice-isolate audio_7133500Hz_…-2026.wav audio_7133500Hz_…-2026.clean.wav
+DONE 1/1 (10s)      real 12.20   user 1.36   sys 1.15
+```
+
+Outputs: `.clean.wav` (float32 mono, 1 207 680 samples) and
+`.clean_background.wav`; `clean + background` reconstructs the mono input to
+182 dB, as the package documents.
+
+The offline checkpoint is a *different* model from the realtime one our port
+implements, so it is not a gate for us — measured for reference:
+
+| comparison | SNR |
+|---|---:|
+| python offline vs python streaming (lookahead 4) | **-0.2 dB** — different checkpoints, unrelated fine detail |
+| our fp32 restart 600/200, cache 1200 vs python streaming | **68.9 dB**, max 4.07e-04 |
+| our delivered int8 sliding vs python streaming | 6.7 dB, best lag 0 samples, corr 0.89 |
+| our int8 sliding vs our own fp32 | 15.7 dB |
+
+So the port itself still matches the realtime reference on this new file
+(68.9 dB, i.e. its own 16-bit floor), and the 6.7 dB of the delivered file is
+entirely the sliding-window default versus the reference's lane restarts — the
+same ~7 dB divergence measured when the sliding default was adopted. Zero lag:
+no time shift, correlation 0.89.
