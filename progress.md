@@ -1053,7 +1053,16 @@ quality gates were anchored on). The ×4/3 tax is platform-independent, so
 the same win is expected on the M4 Max (unmeasured there: int8 18.9 → ~14 s
 est., fp32 30.4 → ~23 s est.).
 
-Verification (running at the time of writing; results appended below):
-rebuild, `vi_tests . quick`, bit-identity of the new-default fp32 run
-against the validated `ab_sw400` arm, int8 determinism rerun plus bit-match
-against `ab_sw400_i8`, `ctest` for native and portable builds.
+Verification (final binaries, new defaults, 2026-11-20): clean rebuild;
+`vi_tests . quick` all green (FFT roundtrip, carried-state selective scan,
+AVX2 int8 strided/tile-slice with and without bias, four-query attention,
+vector math; the `ref/` stage comparison stays skipped — fixtures absent
+throughout this workspace). The new-default fp32 run is **bit-identical**
+to the validated `ab_sw400` arm, and the new-default int8 run is
+**bit-identical** to `ab_sw400_i8` (determinism rerun also bit-identical):
+the default flip is pure configuration, zero change in computation. `ctest`
+1/1 passed for both the native build and the `VI_NATIVE=OFF` portable
+build. New-default timings on this box: fp32 51.51 s (0.86x), int8 22.32 s
+(1.98x). One pre-existing warning from the in-flight WIP surfaced in the
+portable build (`vecmath.cc:1237` unused `inv_s` in `v_quant_pack_a_i8_block`)
+— left for its owner to fix with their commit.
