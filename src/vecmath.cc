@@ -1196,230 +1196,6 @@ void v_quant_pack_a_i8_block(const float* __restrict a, int m0, int mr, int k,
 #endif
 }
 
-void v_pack_a_f32_block(const float* __restrict a, int m0, int mr, int k,
-                        int lda, float* __restrict ap_block) {
-#if VI_HAS_NEON
-  int r = 0;
-  for (; r + 4 <= mr; r += 4) {
-    const float* p0 = a + static_cast<size_t>(m0 + r + 0) * lda;
-    const float* p1 = a + static_cast<size_t>(m0 + r + 1) * lda;
-    const float* p2 = a + static_cast<size_t>(m0 + r + 2) * lda;
-    const float* p3 = a + static_cast<size_t>(m0 + r + 3) * lda;
-    int kk = 0;
-    for (; kk + 4 <= k; kk += 4) {
-      const float32x4_t u0 = vld1q_f32(p0 + kk);
-      const float32x4_t u1 = vld1q_f32(p1 + kk);
-      const float32x4_t u2 = vld1q_f32(p2 + kk);
-      const float32x4_t u3 = vld1q_f32(p3 + kk);
-      const float32x4_t a0 = vtrn1q_f32(u0, u1);
-      const float32x4_t a1 = vtrn2q_f32(u0, u1);
-      const float32x4_t a2 = vtrn1q_f32(u2, u3);
-      const float32x4_t a3 = vtrn2q_f32(u2, u3);
-      const float32x4_t t0 = vreinterpretq_f32_f64(
-          vtrn1q_f64(vreinterpretq_f64_f32(a0), vreinterpretq_f64_f32(a2)));
-      const float32x4_t t1 = vreinterpretq_f32_f64(
-          vtrn1q_f64(vreinterpretq_f64_f32(a1), vreinterpretq_f64_f32(a3)));
-      const float32x4_t t2 = vreinterpretq_f32_f64(
-          vtrn2q_f64(vreinterpretq_f64_f32(a0), vreinterpretq_f64_f32(a2)));
-      const float32x4_t t3 = vreinterpretq_f32_f64(
-          vtrn2q_f64(vreinterpretq_f64_f32(a1), vreinterpretq_f64_f32(a3)));
-      vst1q_f32(ap_block + static_cast<size_t>(kk + 0) * 16 + r, t0);
-      vst1q_f32(ap_block + static_cast<size_t>(kk + 1) * 16 + r, t1);
-      vst1q_f32(ap_block + static_cast<size_t>(kk + 2) * 16 + r, t2);
-      vst1q_f32(ap_block + static_cast<size_t>(kk + 3) * 16 + r, t3);
-    }
-    for (; kk < k; ++kk) {
-      ap_block[static_cast<size_t>(kk) * 16 + r + 0] = p0[kk];
-      ap_block[static_cast<size_t>(kk) * 16 + r + 1] = p1[kk];
-      ap_block[static_cast<size_t>(kk) * 16 + r + 2] = p2[kk];
-      ap_block[static_cast<size_t>(kk) * 16 + r + 3] = p3[kk];
-    }
-  }
-  for (; r < mr; ++r) {
-    const float* pr = a + static_cast<size_t>(m0 + r) * lda;
-    for (int kk = 0; kk < k; ++kk)
-      ap_block[static_cast<size_t>(kk) * 16 + r] = pr[kk];
-  }
-  if (mr < 16) {
-    for (int kk = 0; kk < k; ++kk)
-      for (int rr = mr; rr < 16; ++rr)
-        ap_block[static_cast<size_t>(kk) * 16 + rr] = 0.0f;
-  }
-#else
-  for (int r = 0; r < mr; ++r) {
-    const float* pr = a + static_cast<size_t>(m0 + r) * lda;
-    for (int kk = 0; kk < k; ++kk)
-      ap_block[static_cast<size_t>(kk) * 16 + r] = pr[kk];
-  }
-  if (mr < 16) {
-    for (int kk = 0; kk < k; ++kk)
-      for (int rr = mr; rr < 16; ++rr)
-        ap_block[static_cast<size_t>(kk) * 16 + rr] = 0.0f;
-  }
-#endif
-}
-
-void v_pack_a_f16_block(const float* __restrict a, int m0, int mr, int k,
-                        int lda, uint16_t* __restrict ap_block) {
-  uint32_t* dst32 = reinterpret_cast<uint32_t*>(ap_block);
-  const int k2 = k / 2;
-#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
-  auto cvt8 = [](const float* p) -> uint32x4_t {
-    const float16x4_t lo = vcvt_f16_f32(vld1q_f32(p));
-    const float16x4_t hi = vcvt_f16_f32(vld1q_f32(p + 4));
-    return vreinterpretq_u32_f16(vcombine_f16(lo, hi));
-  };
-  int r = 0;
-  for (; r + 4 <= mr; r += 4) {
-    const float* p0 = a + static_cast<size_t>(m0 + r + 0) * lda;
-    const float* p1 = a + static_cast<size_t>(m0 + r + 1) * lda;
-    const float* p2 = a + static_cast<size_t>(m0 + r + 2) * lda;
-    const float* p3 = a + static_cast<size_t>(m0 + r + 3) * lda;
-    int kk = 0;
-    for (; kk + 8 <= k; kk += 8) {
-      const uint32x4_t u0 = cvt8(p0 + kk);
-      const uint32x4_t u1 = cvt8(p1 + kk);
-      const uint32x4_t u2 = cvt8(p2 + kk);
-      const uint32x4_t u3 = cvt8(p3 + kk);
-      const uint32x4_t a0 = vtrn1q_u32(u0, u1);
-      const uint32x4_t a1 = vtrn2q_u32(u0, u1);
-      const uint32x4_t a2 = vtrn1q_u32(u2, u3);
-      const uint32x4_t a3 = vtrn2q_u32(u2, u3);
-      const uint32x4_t t0 = vreinterpretq_u32_u64(
-          vtrn1q_u64(vreinterpretq_u64_u32(a0), vreinterpretq_u64_u32(a2)));
-      const uint32x4_t t1 = vreinterpretq_u32_u64(
-          vtrn1q_u64(vreinterpretq_u64_u32(a1), vreinterpretq_u64_u32(a3)));
-      const uint32x4_t t2 = vreinterpretq_u32_u64(
-          vtrn2q_u64(vreinterpretq_u64_u32(a0), vreinterpretq_u64_u32(a2)));
-      const uint32x4_t t3 = vreinterpretq_u32_u64(
-          vtrn2q_u64(vreinterpretq_u64_u32(a1), vreinterpretq_u64_u32(a3)));
-      const int kk2 = kk / 2;
-      vst1q_u32(dst32 + static_cast<size_t>(kk2 + 0) * 16 + r, t0);
-      vst1q_u32(dst32 + static_cast<size_t>(kk2 + 1) * 16 + r, t1);
-      vst1q_u32(dst32 + static_cast<size_t>(kk2 + 2) * 16 + r, t2);
-      vst1q_u32(dst32 + static_cast<size_t>(kk2 + 3) * 16 + r, t3);
-    }
-    for (; kk < k; kk += 2) {
-      const int kk2 = kk / 2;
-      __fp16* d = reinterpret_cast<__fp16*>(ap_block);
-      d[(static_cast<size_t>(kk2) * 16 + r + 0) * 2 + 0] = static_cast<__fp16>(p0[kk]);
-      d[(static_cast<size_t>(kk2) * 16 + r + 0) * 2 + 1] = static_cast<__fp16>(p0[kk + 1]);
-      d[(static_cast<size_t>(kk2) * 16 + r + 1) * 2 + 0] = static_cast<__fp16>(p1[kk]);
-      d[(static_cast<size_t>(kk2) * 16 + r + 1) * 2 + 1] = static_cast<__fp16>(p1[kk + 1]);
-      d[(static_cast<size_t>(kk2) * 16 + r + 2) * 2 + 0] = static_cast<__fp16>(p2[kk]);
-      d[(static_cast<size_t>(kk2) * 16 + r + 2) * 2 + 1] = static_cast<__fp16>(p2[kk + 1]);
-      d[(static_cast<size_t>(kk2) * 16 + r + 3) * 2 + 0] = static_cast<__fp16>(p3[kk]);
-      d[(static_cast<size_t>(kk2) * 16 + r + 3) * 2 + 1] = static_cast<__fp16>(p3[kk + 1]);
-    }
-  }
-  for (; r < mr; ++r) {
-    const float* pr = a + static_cast<size_t>(m0 + r) * lda;
-    int kk = 0;
-    for (; kk + 8 <= k; kk += 8) {
-      const uint32x4_t u = cvt8(pr + kk);
-      const int kk2 = kk / 2;
-      dst32[static_cast<size_t>(kk2 + 0) * 16 + r] = vgetq_lane_u32(u, 0);
-      dst32[static_cast<size_t>(kk2 + 1) * 16 + r] = vgetq_lane_u32(u, 1);
-      dst32[static_cast<size_t>(kk2 + 2) * 16 + r] = vgetq_lane_u32(u, 2);
-      dst32[static_cast<size_t>(kk2 + 3) * 16 + r] = vgetq_lane_u32(u, 3);
-    }
-    __fp16* d = reinterpret_cast<__fp16*>(ap_block);
-    for (; kk < k; kk += 2) {
-      const int kk2 = kk / 2;
-      d[(static_cast<size_t>(kk2) * 16 + r) * 2 + 0] = static_cast<__fp16>(pr[kk]);
-      d[(static_cast<size_t>(kk2) * 16 + r) * 2 + 1] = static_cast<__fp16>(pr[kk + 1]);
-    }
-  }
-  if (mr < 16) {
-    for (int kk2 = 0; kk2 < k2; ++kk2)
-      for (int rr = mr; rr < 16; ++rr)
-        dst32[static_cast<size_t>(kk2) * 16 + rr] = 0;
-  }
-#else
-  (void)a; (void)m0; (void)mr; (void)k; (void)lda; (void)dst32; (void)k2;
-#endif
-}
-
-void v_pack_a_bf16_block(const float* __restrict a, int m0, int mr, int k,
-                         int lda, uint16_t* __restrict ap_block) {
-  uint32_t* dst32 = reinterpret_cast<uint32_t*>(ap_block);
-  const int k2 = k / 2;
-#if VI_HAS_NEON
-  const uint32x4_t vbias = vdupq_n_u32(0x7FFFu);
-  const uint32x4_t vone = vdupq_n_u32(1u);
-  auto cvt8_bf16 = [&](const float* p) -> uint32x4_t {
-    const uint32x4_t u0 = vreinterpretq_u32_f32(vld1q_f32(p));
-    const uint32x4_t u1 = vreinterpretq_u32_f32(vld1q_f32(p + 4));
-    const uint32x4_t r0 = vaddq_u32(u0, vaddq_u32(vbias, vandq_u32(vshrq_n_u32(u0, 16), vone)));
-    const uint32x4_t r1 = vaddq_u32(u1, vaddq_u32(vbias, vandq_u32(vshrq_n_u32(u1, 16), vone)));
-    return vreinterpretq_u32_u16(vcombine_u16(vshrn_n_u32(r0, 16), vshrn_n_u32(r1, 16)));
-  };
-  int r = 0;
-  for (; r + 4 <= mr; r += 4) {
-    const float* p0 = a + static_cast<size_t>(m0 + r + 0) * lda;
-    const float* p1 = a + static_cast<size_t>(m0 + r + 1) * lda;
-    const float* p2 = a + static_cast<size_t>(m0 + r + 2) * lda;
-    const float* p3 = a + static_cast<size_t>(m0 + r + 3) * lda;
-    int kk = 0;
-    for (; kk + 8 <= k; kk += 8) {
-      const uint32x4_t u0 = cvt8_bf16(p0 + kk);
-      const uint32x4_t u1 = cvt8_bf16(p1 + kk);
-      const uint32x4_t u2 = cvt8_bf16(p2 + kk);
-      const uint32x4_t u3 = cvt8_bf16(p3 + kk);
-      const uint32x4_t a0 = vtrn1q_u32(u0, u1);
-      const uint32x4_t a1 = vtrn2q_u32(u0, u1);
-      const uint32x4_t a2 = vtrn1q_u32(u2, u3);
-      const uint32x4_t a3 = vtrn2q_u32(u2, u3);
-      const uint32x4_t t0 = vreinterpretq_u32_u64(
-          vtrn1q_u64(vreinterpretq_u64_u32(a0), vreinterpretq_u64_u32(a2)));
-      const uint32x4_t t1 = vreinterpretq_u32_u64(
-          vtrn1q_u64(vreinterpretq_u64_u32(a1), vreinterpretq_u64_u32(a3)));
-      const uint32x4_t t2 = vreinterpretq_u32_u64(
-          vtrn2q_u64(vreinterpretq_u64_u32(a0), vreinterpretq_u64_u32(a2)));
-      const uint32x4_t t3 = vreinterpretq_u32_u64(
-          vtrn2q_u64(vreinterpretq_u64_u32(a1), vreinterpretq_u64_u32(a3)));
-      const int kk2 = kk / 2;
-      vst1q_u32(dst32 + static_cast<size_t>(kk2 + 0) * 16 + r, t0);
-      vst1q_u32(dst32 + static_cast<size_t>(kk2 + 1) * 16 + r, t1);
-      vst1q_u32(dst32 + static_cast<size_t>(kk2 + 2) * 16 + r, t2);
-      vst1q_u32(dst32 + static_cast<size_t>(kk2 + 3) * 16 + r, t3);
-    }
-    for (; kk < k; kk += 2) {
-      const int kk2 = kk / 2;
-      const float* ps[4] = {p0, p1, p2, p3};
-      for (int u = 0; u < 4; ++u) {
-        uint32_t x0, x1;
-        std::memcpy(&x0, ps[u] + kk, 4);
-        std::memcpy(&x1, ps[u] + kk + 1, 4);
-        x0 += 0x7FFFu + ((x0 >> 16) & 1u);
-        x1 += 0x7FFFu + ((x1 >> 16) & 1u);
-        ap_block[(static_cast<size_t>(kk2) * 16 + r + u) * 2 + 0] = static_cast<uint16_t>(x0 >> 16);
-        ap_block[(static_cast<size_t>(kk2) * 16 + r + u) * 2 + 1] = static_cast<uint16_t>(x1 >> 16);
-      }
-    }
-  }
-  for (; r < mr; ++r) {
-    const float* pr = a + static_cast<size_t>(m0 + r) * lda;
-    for (int kk = 0; kk < k; kk += 2) {
-      uint32_t x0, x1;
-      std::memcpy(&x0, pr + kk, 4);
-      std::memcpy(&x1, pr + kk + 1, 4);
-      x0 += 0x7FFFu + ((x0 >> 16) & 1u);
-      x1 += 0x7FFFu + ((x1 >> 16) & 1u);
-      ap_block[(static_cast<size_t>(kk / 2) * 16 + r) * 2 + 0] = static_cast<uint16_t>(x0 >> 16);
-      ap_block[(static_cast<size_t>(kk / 2) * 16 + r) * 2 + 1] = static_cast<uint16_t>(x1 >> 16);
-    }
-  }
-  if (mr < 16) {
-    for (int kk2 = 0; kk2 < k2; ++kk2)
-      for (int rr = mr; rr < 16; ++rr)
-        dst32[static_cast<size_t>(kk2) * 16 + rr] = 0;
-  }
-#else
-  (void)a; (void)m0; (void)mr; (void)k; (void)lda; (void)dst32; (void)k2;
-#endif
-}
-
 bool fp16_neon_available() {
 #if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
   return true;
@@ -1588,6 +1364,36 @@ void v_attn4_pv_f16(const float* __restrict p0, const float* __restrict p1,
       const __fp16* vj = values + static_cast<size_t>(j0) * hd + d;
       int j = j0;
       for (; j + 4 <= j1; j += 4) {
+#if defined(__ARM_FEATURE_FP16_FML)
+        const float16x4_t wp0 = vcvt_f16_f32(vld1q_f32(p0 + j));
+        const float16x4_t wp1 = vcvt_f16_f32(vld1q_f32(p1 + j));
+        const float16x4_t wp2 = vcvt_f16_f32(vld1q_f32(p2 + j));
+        const float16x4_t wp3 = vcvt_f16_f32(vld1q_f32(p3 + j));
+#define PVF16_STEP(lane)                                                       \
+  do {                                                                         \
+    const float16x8_t h0 = vld1q_f16(vj + 0);                                  \
+    const float16x8_t h1 = vld1q_f16(vj + 8);                                  \
+    a00 = vfmlalq_lane_low_f16(a00, h0, wp0, lane);                            \
+    a01 = vfmlalq_lane_high_f16(a01, h0, wp0, lane);                           \
+    a02 = vfmlalq_lane_low_f16(a02, h1, wp0, lane);                            \
+    a03 = vfmlalq_lane_high_f16(a03, h1, wp0, lane);                           \
+    a10 = vfmlalq_lane_low_f16(a10, h0, wp1, lane);                            \
+    a11 = vfmlalq_lane_high_f16(a11, h0, wp1, lane);                           \
+    a12 = vfmlalq_lane_low_f16(a12, h1, wp1, lane);                            \
+    a13 = vfmlalq_lane_high_f16(a13, h1, wp1, lane);                           \
+    a20 = vfmlalq_lane_low_f16(a20, h0, wp2, lane);                            \
+    a21 = vfmlalq_lane_high_f16(a21, h0, wp2, lane);                           \
+    a22 = vfmlalq_lane_low_f16(a22, h1, wp2, lane);                            \
+    a23 = vfmlalq_lane_high_f16(a23, h1, wp2, lane);                           \
+    a30 = vfmlalq_lane_low_f16(a30, h0, wp3, lane);                            \
+    a31 = vfmlalq_lane_high_f16(a31, h0, wp3, lane);                           \
+    a32 = vfmlalq_lane_low_f16(a32, h1, wp3, lane);                            \
+    a33 = vfmlalq_lane_high_f16(a33, h1, wp3, lane);                           \
+    vj += hd;                                                                  \
+  } while (0)
+        PVF16_STEP(0); PVF16_STEP(1); PVF16_STEP(2); PVF16_STEP(3);
+#undef PVF16_STEP
+#else
         const float32x4_t wp0 = vld1q_f32(p0 + j);
         const float32x4_t wp1 = vld1q_f32(p1 + j);
         const float32x4_t wp2 = vld1q_f32(p2 + j);
@@ -1620,6 +1426,7 @@ void v_attn4_pv_f16(const float* __restrict p0, const float* __restrict p1,
   } while (0)
         PVF16_STEP(0); PVF16_STEP(1); PVF16_STEP(2); PVF16_STEP(3);
 #undef PVF16_STEP
+#endif
       }
       for (; j < j1; ++j) {
         const float16x8_t h0 = vld1q_f16(vj + 0);

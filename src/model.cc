@@ -55,8 +55,6 @@ inline bool worth_splitting(int64_t ops) { return ops >= kMinParallelOps; }
 // but not so fine that the fixed cost per unit dominates.
 int channel_split(int tasks, int inner) {
   const int threads = default_pool().size();
-  // Round up: the frequency layers have only `frames` tasks (4), and floor
-  // division left them running on 4 of the 6 threads.
   const int wanted = std::max(1, threads / std::max(1, tasks));
   const int largest = std::max(1, inner / 128);
   return std::min(wanted, largest);
@@ -663,7 +661,7 @@ bool Model::linear_par_sme(const float* a, int m, int k, int stride,
   // Apple M4 Max has 2 SME2 units (1 per 5-core P-cluster). Running more than
   // 2 SME threads concurrently causes severe ZA/arbiter contention across cores
   // in the same cluster (measured 1.37 s at 2 chunks vs 2.43 s at 8 chunks).
-  const int max_sme_chunks = []() {
+  static const int max_sme_chunks = []() {
     if (const char* env = std::getenv("VI_SME_CHUNKS")) {
       const int v = std::atoi(env);
       if (v >= 1) return v;
@@ -1068,21 +1066,26 @@ void Model::time_transformer(const AttnWeights& w, float* feat, int frames,
   const int past_lo = std::max(0, first - lp.cache_frames);
   const size_t lane_stride = static_cast<size_t>(st.capacity) * hd;
   const size_t score_stride = static_cast<size_t>(lp.capacity_limit);
+  const int total_bh = bands * heads;
+  const int achunks = std::min(default_pool().size(), total_bh);
 
-  default_pool().parallel_for(bands, [&](int b) {
-    float* kbase = use_f16_kv ? nullptr : st.k.data() + static_cast<size_t>(b) * st.capacity * width;
-    float* vbase = use_f16_kv ? nullptr : st.v.data() + static_cast<size_t>(b) * st.capacity * width;
-    uint16_t* k16base = use_f16_kv ? st.k16.data() + static_cast<size_t>(b) * st.capacity * width : nullptr;
-    uint16_t* v16base = use_f16_kv ? st.v16.data() + static_cast<size_t>(b) * st.capacity * width : nullptr;
-    float* scores_base = sc.scores.data() + static_cast<size_t>(b) * 4 * score_stride;
+  default_pool().parallel_for(achunks, [&](int cid) {
+    const int u0 = static_cast<int>(static_cast<int64_t>(total_bh) * cid / achunks);
+    const int u1 = static_cast<int>(static_cast<int64_t>(total_bh) * (cid + 1) / achunks);
+    float* scores_base = sc.scores.data() + static_cast<size_t>(cid) * 4 * score_stride;
+    for (int u = u0; u < u1; ++u) {
+      const int b = u / heads;
+      const int h = u % heads;
+      float* kbase = use_f16_kv ? nullptr : st.k.data() + static_cast<size_t>(b) * st.capacity * width;
+      float* vbase = use_f16_kv ? nullptr : st.v.data() + static_cast<size_t>(b) * st.capacity * width;
+      uint16_t* k16base = use_f16_kv ? st.k16.data() + static_cast<size_t>(b) * st.capacity * width : nullptr;
+      uint16_t* v16base = use_f16_kv ? st.v16.data() + static_cast<size_t>(b) * st.capacity * width : nullptr;
 
-    for (int t = 0; t < frames; ++t) {
-      const int pos = first + t;
-      float* row =
-          sc.qkv.data() + static_cast<size_t>(b * frames + t) * 3 * width;
-      const float* cos = rope.cos_at(pos);
-      const float* sin = rope.sin_at(pos);
-      for (int h = 0; h < heads; ++h) {
+      for (int t = 0; t < frames; ++t) {
+        const int pos = first + t;
+        float* row = sc.qkv.data() + static_cast<size_t>(b * frames + t) * 3 * width;
+        const float* cos = rope.cos_at(pos);
+        const float* sin = rope.sin_at(pos);
         float* q = row + h * hd;
         float* k = row + width + h * hd;
         const float* v = row + 2 * width + h * hd;
@@ -1098,36 +1101,34 @@ void Model::time_transformer(const AttnWeights& w, float* feat, int frames,
           std::memcpy(vbase + slot_off, v, sizeof(float) * hd);
         }
       }
-    }
 
-    int t0 = 0;
-    for (; t0 + 4 <= frames; t0 += 4) {
-      int pos[4], lo[4];
-      for (int r = 0; r < 4; ++r) {
-        pos[r] = first + t0 + r;
-        lo[r] = past_lo;
-        if (lp.window > 0) lo[r] = std::max(lo[r], pos[r] - lp.window + 1);
-      }
-      const int span_lo = lo[0];
-      const int n_span = pos[3] - span_lo + 1;
-      const size_t first_slot = static_cast<size_t>(span_lo) * hd;
+      int t0 = 0;
+      for (; t0 + 4 <= frames; t0 += 4) {
+        int pos[4], lo[4];
+        for (int r = 0; r < 4; ++r) {
+          pos[r] = first + t0 + r;
+          lo[r] = past_lo;
+          if (lp.window > 0) lo[r] = std::max(lo[r], pos[r] - lp.window + 1);
+        }
+        const int span_lo = lo[0];
+        const int n_span = pos[3] - span_lo + 1;
+        const size_t head_slot =
+            static_cast<size_t>(h) * lane_stride + static_cast<size_t>(span_lo) * hd;
 
-      const float* r0 = sc.qkv.data() + static_cast<size_t>(b * frames + t0 + 0) * 3 * width;
-      const float* r1 = sc.qkv.data() + static_cast<size_t>(b * frames + t0 + 1) * 3 * width;
-      const float* r2 = sc.qkv.data() + static_cast<size_t>(b * frames + t0 + 2) * 3 * width;
-      const float* r3 = sc.qkv.data() + static_cast<size_t>(b * frames + t0 + 3) * 3 * width;
-      float* out0 = sc.attn.data() + static_cast<size_t>(b * frames + t0 + 0) * width;
-      float* out1 = sc.attn.data() + static_cast<size_t>(b * frames + t0 + 1) * width;
-      float* out2 = sc.attn.data() + static_cast<size_t>(b * frames + t0 + 2) * width;
-      float* out3 = sc.attn.data() + static_cast<size_t>(b * frames + t0 + 3) * width;
-      float* s0 = scores_base + 0 * score_stride;
-      float* s1 = scores_base + 1 * score_stride;
-      float* s2 = scores_base + 2 * score_stride;
-      float* s3 = scores_base + 3 * score_stride;
-      float* sptrs[4] = {s0, s1, s2, s3};
+        const float* r0 = sc.qkv.data() + static_cast<size_t>(b * frames + t0 + 0) * 3 * width;
+        const float* r1 = sc.qkv.data() + static_cast<size_t>(b * frames + t0 + 1) * 3 * width;
+        const float* r2 = sc.qkv.data() + static_cast<size_t>(b * frames + t0 + 2) * 3 * width;
+        const float* r3 = sc.qkv.data() + static_cast<size_t>(b * frames + t0 + 3) * 3 * width;
+        float* o0 = sc.attn.data() + static_cast<size_t>(b * frames + t0 + 0) * width + h * hd;
+        float* o1 = sc.attn.data() + static_cast<size_t>(b * frames + t0 + 1) * width + h * hd;
+        float* o2 = sc.attn.data() + static_cast<size_t>(b * frames + t0 + 2) * width + h * hd;
+        float* o3 = sc.attn.data() + static_cast<size_t>(b * frames + t0 + 3) * width + h * hd;
+        float* s0 = scores_base + 0 * score_stride;
+        float* s1 = scores_base + 1 * score_stride;
+        float* s2 = scores_base + 2 * score_stride;
+        float* s3 = scores_base + 3 * score_stride;
+        float* sptrs[4] = {s0, s1, s2, s3};
 
-      for (int h = 0; h < heads; ++h) {
-        const size_t head_slot = static_cast<size_t>(h) * lane_stride + first_slot;
         {
           Timer slot(pf_single ? &profile().attn_scores : nullptr);
           if (use_f16_kv)
@@ -1144,10 +1145,6 @@ void Model::time_transformer(const AttnWeights& w, float* feat, int frames,
             for (int z = en_r; z < n_span; ++z) sptrs[r][z] = 0.0f;
           }
         }
-        float* o0 = out0 + h * hd;
-        float* o1 = out1 + h * hd;
-        float* o2 = out2 + h * hd;
-        float* o3 = out3 + h * hd;
         {
           Timer slot(pf_single ? &profile().attn_pv : nullptr);
           if (use_f16_kv)
@@ -1167,22 +1164,17 @@ void Model::time_transformer(const AttnWeights& w, float* feat, int frames,
           axpy(optrs[r], -coef, vptrs[r], hd);
         }
       }
-    }
 
-    for (int t = t0; t < frames; ++t) {
-      const int pos = first + t;
-      const float* row =
-          sc.qkv.data() + static_cast<size_t>(b * frames + t) * 3 * width;
-      float* out =
-          sc.attn.data() + static_cast<size_t>(b * frames + t) * width;
-      int lo = past_lo;
-      if (lp.window > 0) lo = std::max(lo, pos - lp.window + 1);
-      const int n = pos - lo + 1;
-      const size_t first_slot = static_cast<size_t>(lo) * hd;
-
-      for (int h = 0; h < heads; ++h) {
+      for (int t = t0; t < frames; ++t) {
+        const int pos = first + t;
+        const float* row = sc.qkv.data() + static_cast<size_t>(b * frames + t) * 3 * width;
+        float* o = sc.attn.data() + static_cast<size_t>(b * frames + t) * width + h * hd;
+        int lo = past_lo;
+        if (lp.window > 0) lo = std::max(lo, pos - lp.window + 1);
+        const int n = pos - lo + 1;
+        const size_t head_slot =
+            static_cast<size_t>(h) * lane_stride + static_cast<size_t>(lo) * hd;
         const float* q = row + h * hd;
-        const size_t head_slot = static_cast<size_t>(h) * lane_stride + first_slot;
         float* s = scores_base;
         float sum;
         {
@@ -1193,7 +1185,6 @@ void Model::time_transformer(const AttnWeights& w, float* feat, int frames,
             sum = scores_softmax(q, kbase + head_slot, n, hd, scale, s);
         }
         const float inv = 1.0f / sum;
-        float* o = out + h * hd;
         {
           Timer slot(pf_single ? &profile().attn_pv : nullptr);
           if (use_f16_kv)
@@ -1310,29 +1301,36 @@ void Model::time_transformer_pair(const AttnWeights& w, float* pair_feat,
 
   const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
   AttnState* states[2] = {&st_a, &st_b};
+  const int bh_per_lane = bands * heads;
+  const int total_bh = 2 * bh_per_lane;
+  const int achunks = std::min(default_pool().size(), total_bh);
 
-  default_pool().parallel_for(2 * bands, [&](int idx) {
-    const int lane_idx = idx / bands;
-    const int b = idx % bands;
-    AttnState& st = *states[lane_idx];
-    const int first = firsts[lane_idx];
-    const int past_lo = std::max(0, first - lp.cache_frames);
-    const size_t lane_stride = static_cast<size_t>(st.capacity) * hd;
-    float* kbase = use_f16_kv ? nullptr : st.k.data() + static_cast<size_t>(b) * st.capacity * width;
-    float* vbase = use_f16_kv ? nullptr : st.v.data() + static_cast<size_t>(b) * st.capacity * width;
-    uint16_t* k16base = use_f16_kv ? st.k16.data() + static_cast<size_t>(b) * st.capacity * width : nullptr;
-    uint16_t* v16base = use_f16_kv ? st.v16.data() + static_cast<size_t>(b) * st.capacity * width : nullptr;
+  default_pool().parallel_for(achunks, [&](int cid) {
+    const int u0 = static_cast<int>(static_cast<int64_t>(total_bh) * cid / achunks);
+    const int u1 = static_cast<int>(static_cast<int64_t>(total_bh) * (cid + 1) / achunks);
     float* scores_base =
-        sc.scores.data() + static_cast<size_t>(idx) * 4 * score_stride;
-    const size_t row_off = static_cast<size_t>(lane_idx) * rows;
+        sc.scores.data() + static_cast<size_t>(cid) * 4 * score_stride;
+    for (int u = u0; u < u1; ++u) {
+      const int lane_idx = u / bh_per_lane;
+      const int rem = u % bh_per_lane;
+      const int b = rem / heads;
+      const int h = rem % heads;
+      AttnState& st = *states[lane_idx];
+      const int first = firsts[lane_idx];
+      const int past_lo = std::max(0, first - lp.cache_frames);
+      const size_t lane_stride = static_cast<size_t>(st.capacity) * hd;
+      float* kbase = use_f16_kv ? nullptr : st.k.data() + static_cast<size_t>(b) * st.capacity * width;
+      float* vbase = use_f16_kv ? nullptr : st.v.data() + static_cast<size_t>(b) * st.capacity * width;
+      uint16_t* k16base = use_f16_kv ? st.k16.data() + static_cast<size_t>(b) * st.capacity * width : nullptr;
+      uint16_t* v16base = use_f16_kv ? st.v16.data() + static_cast<size_t>(b) * st.capacity * width : nullptr;
+      const size_t row_off = static_cast<size_t>(lane_idx) * rows;
 
-    for (int t = 0; t < frames; ++t) {
-      const int pos = first + t;
-      float* row = sc.qkv.data() +
-                   (row_off + static_cast<size_t>(b * frames + t)) * 3 * width;
-      const float* cos = rope.cos_at(pos);
-      const float* sin = rope.sin_at(pos);
-      for (int h = 0; h < heads; ++h) {
+      for (int t = 0; t < frames; ++t) {
+        const int pos = first + t;
+        float* row = sc.qkv.data() +
+                     (row_off + static_cast<size_t>(b * frames + t)) * 3 * width;
+        const float* cos = rope.cos_at(pos);
+        const float* sin = rope.sin_at(pos);
         float* q = row + h * hd;
         float* k = row + width + h * hd;
         const float* v = row + 2 * width + h * hd;
@@ -1348,36 +1346,34 @@ void Model::time_transformer_pair(const AttnWeights& w, float* pair_feat,
           std::memcpy(vbase + slot_off, v, sizeof(float) * hd);
         }
       }
-    }
 
-    int t0 = 0;
-    for (; t0 + 4 <= frames; t0 += 4) {
-      int pos[4], lo[4];
-      for (int r = 0; r < 4; ++r) {
-        pos[r] = first + t0 + r;
-        lo[r] = past_lo;
-        if (lp.window > 0) lo[r] = std::max(lo[r], pos[r] - lp.window + 1);
-      }
-      const int span_lo = lo[0];
-      const int n_span = pos[3] - span_lo + 1;
-      const size_t first_slot = static_cast<size_t>(span_lo) * hd;
+      int t0 = 0;
+      for (; t0 + 4 <= frames; t0 += 4) {
+        int pos[4], lo[4];
+        for (int r = 0; r < 4; ++r) {
+          pos[r] = first + t0 + r;
+          lo[r] = past_lo;
+          if (lp.window > 0) lo[r] = std::max(lo[r], pos[r] - lp.window + 1);
+        }
+        const int span_lo = lo[0];
+        const int n_span = pos[3] - span_lo + 1;
+        const size_t head_slot =
+            static_cast<size_t>(h) * lane_stride + static_cast<size_t>(span_lo) * hd;
 
-      const float* r0 = sc.qkv.data() + (row_off + static_cast<size_t>(b * frames + t0 + 0)) * 3 * width;
-      const float* r1 = sc.qkv.data() + (row_off + static_cast<size_t>(b * frames + t0 + 1)) * 3 * width;
-      const float* r2 = sc.qkv.data() + (row_off + static_cast<size_t>(b * frames + t0 + 2)) * 3 * width;
-      const float* r3 = sc.qkv.data() + (row_off + static_cast<size_t>(b * frames + t0 + 3)) * 3 * width;
-      float* out0 = sc.attn.data() + (row_off + static_cast<size_t>(b * frames + t0 + 0)) * width;
-      float* out1 = sc.attn.data() + (row_off + static_cast<size_t>(b * frames + t0 + 1)) * width;
-      float* out2 = sc.attn.data() + (row_off + static_cast<size_t>(b * frames + t0 + 2)) * width;
-      float* out3 = sc.attn.data() + (row_off + static_cast<size_t>(b * frames + t0 + 3)) * width;
-      float* s0 = scores_base + 0 * score_stride;
-      float* s1 = scores_base + 1 * score_stride;
-      float* s2 = scores_base + 2 * score_stride;
-      float* s3 = scores_base + 3 * score_stride;
-      float* sptrs[4] = {s0, s1, s2, s3};
+        const float* r0 = sc.qkv.data() + (row_off + static_cast<size_t>(b * frames + t0 + 0)) * 3 * width;
+        const float* r1 = sc.qkv.data() + (row_off + static_cast<size_t>(b * frames + t0 + 1)) * 3 * width;
+        const float* r2 = sc.qkv.data() + (row_off + static_cast<size_t>(b * frames + t0 + 2)) * 3 * width;
+        const float* r3 = sc.qkv.data() + (row_off + static_cast<size_t>(b * frames + t0 + 3)) * 3 * width;
+        float* o0 = sc.attn.data() + (row_off + static_cast<size_t>(b * frames + t0 + 0)) * width + h * hd;
+        float* o1 = sc.attn.data() + (row_off + static_cast<size_t>(b * frames + t0 + 1)) * width + h * hd;
+        float* o2 = sc.attn.data() + (row_off + static_cast<size_t>(b * frames + t0 + 2)) * width + h * hd;
+        float* o3 = sc.attn.data() + (row_off + static_cast<size_t>(b * frames + t0 + 3)) * width + h * hd;
+        float* s0 = scores_base + 0 * score_stride;
+        float* s1 = scores_base + 1 * score_stride;
+        float* s2 = scores_base + 2 * score_stride;
+        float* s3 = scores_base + 3 * score_stride;
+        float* sptrs[4] = {s0, s1, s2, s3};
 
-      for (int h = 0; h < heads; ++h) {
-        const size_t head_slot = static_cast<size_t>(h) * lane_stride + first_slot;
         if (use_f16_kv)
           v_attn4_qk_f16(r0 + h * hd, r1 + h * hd, r2 + h * hd, r3 + h * hd,
                          k16base + head_slot, n_span, hd, scale, s0, s1, s2, s3);
@@ -1391,10 +1387,6 @@ void Model::time_transformer_pair(const AttnWeights& w, float* pair_feat,
           for (int z = 0; z < st_r; ++z) sptrs[r][z] = 0.0f;
           for (int z = en_r; z < n_span; ++z) sptrs[r][z] = 0.0f;
         }
-        float* o0 = out0 + h * hd;
-        float* o1 = out1 + h * hd;
-        float* o2 = out2 + h * hd;
-        float* o3 = out3 + h * hd;
         if (use_f16_kv)
           v_attn4_pv_f16(s0, s1, s2, s3, v16base + head_slot, n_span, hd,
                          o0, o1, o2, o3);
@@ -1411,26 +1403,23 @@ void Model::time_transformer_pair(const AttnWeights& w, float* pair_feat,
           axpy(optrs[r], -coef, vptrs[r], hd);
         }
       }
-    }
-    for (int t = t0; t < frames; ++t) {
-      const int pos = first + t;
-      const float* row = sc.qkv.data() +
-                         (row_off + static_cast<size_t>(b * frames + t)) * 3 * width;
-      float* out = sc.attn.data() +
-                   (row_off + static_cast<size_t>(b * frames + t)) * width;
-      int lo = past_lo;
-      if (lp.window > 0) lo = std::max(lo, pos - lp.window + 1);
-      const int n = pos - lo + 1;
-      const size_t first_slot = static_cast<size_t>(lo) * hd;
-      for (int h = 0; h < heads; ++h) {
+      for (int t = t0; t < frames; ++t) {
+        const int pos = first + t;
+        const float* row = sc.qkv.data() +
+                           (row_off + static_cast<size_t>(b * frames + t)) * 3 * width;
+        float* o = sc.attn.data() +
+                   (row_off + static_cast<size_t>(b * frames + t)) * width + h * hd;
+        int lo = past_lo;
+        if (lp.window > 0) lo = std::max(lo, pos - lp.window + 1);
+        const int n = pos - lo + 1;
+        const size_t head_slot =
+            static_cast<size_t>(h) * lane_stride + static_cast<size_t>(lo) * hd;
         const float* q = row + h * hd;
-        const size_t head_slot = static_cast<size_t>(h) * lane_stride + first_slot;
         float* s = scores_base;
         const float sum = use_f16_kv
                               ? v_attn1_scores_softmax_f16(q, k16base + head_slot, n, hd, scale, s)
                               : scores_softmax(q, kbase + head_slot, n, hd, scale, s);
         const float inv = 1.0f / sum;
-        float* o = out + h * hd;
         if (use_f16_kv)
           v_attn1_pv_f16(s, inv, v16base + head_slot, n, hd, o);
         else
@@ -1598,16 +1587,21 @@ void Model::mamba_layer(const MambaLayer& l, const float* x, int rows, int len,
   // task is split into 4-channel-aligned ranges.
   const int split = channel_split(tasks, inner);
   const int c_groups = inner / 4;
+  const int total_units = tasks * split;
+  const int mchunks = std::min(default_pool().size(), total_units);
   {
     Timer slot(profile_enabled() ? &profile().mamba_conv : nullptr);
-    default_pool().parallel_for(tasks * split, [&](int unit) {
+    default_pool().parallel_for(mchunks, [&](int cid) {
+      const int u0 = static_cast<int>(static_cast<int64_t>(total_units) * cid / mchunks);
+      const int u1 = static_cast<int>(static_cast<int64_t>(total_units) * (cid + 1) / mchunks);
+      for (int unit = u0; unit < u1; ++unit) {
       const int task = unit / split;
       const int part = unit % split;
       const int c0 =
           4 * static_cast<int>(static_cast<int64_t>(c_groups) * part / split);
       const int c1 = 4 * static_cast<int>(static_cast<int64_t>(c_groups) *
                                           (part + 1) / split);
-      if (c1 <= c0) return;
+      if (c1 <= c0) continue;
       const int channels = c1 - c0;
       float* ext = slab_ext + static_cast<size_t>(task) * ext_stride;
       if (conv_state != nullptr) {
@@ -1672,6 +1666,7 @@ void Model::mamba_layer(const MambaLayer& l, const float* x, int rows, int len,
                       ext + static_cast<size_t>(len + j) * inner + c0,
                       sizeof(float) * static_cast<size_t>(channels));
       }
+      }
     });
   }
 
@@ -1690,7 +1685,10 @@ void Model::mamba_layer(const MambaLayer& l, const float* x, int rows, int len,
         !l.a_log2e8_16.empty() && (inner % 8 == 0);
     const int align_c = use_f16_scan ? 8 : 4;
     const int scan_groups = inner / align_c;
-    default_pool().parallel_for(tasks * split, [&](int unit) {
+    default_pool().parallel_for(mchunks, [&](int cid) {
+      const int u0 = static_cast<int>(static_cast<int64_t>(total_units) * cid / mchunks);
+      const int u1 = static_cast<int>(static_cast<int64_t>(total_units) * (cid + 1) / mchunks);
+      for (int unit = u0; unit < u1; ++unit) {
       const int task = unit / split;
       const int part = unit % split;
       const int c0 = align_c * static_cast<int>(
@@ -1699,7 +1697,7 @@ void Model::mamba_layer(const MambaLayer& l, const float* x, int rows, int len,
       const int c1 = align_c * static_cast<int>(
                                    static_cast<int64_t>(scan_groups) *
                                    (part + 1) / split);
-      if (c1 <= c0) return;
+      if (c1 <= c0) continue;
       float* h = ssm_state != nullptr
                      ? ssm_state + static_cast<size_t>(task) * state_stride
                      : nullptr;
@@ -1720,6 +1718,7 @@ void Model::mamba_layer(const MambaLayer& l, const float* x, int rows, int len,
                      sc.xp.data() + row0 * dt_total,
                      sc.y.data() + row0 * inner,
                      len, inner, state, dt_rank, dt_total, c0, c1);
+      }
     });
   }
 
@@ -1749,12 +1748,17 @@ void Model::mamba_layer_pair(const MambaLayer& l, const float* x, int rows_each,
   const size_t state_stride = static_cast<size_t>(state) * inner;
   const int split = channel_split(tasks, inner);
   const int c_groups = inner / 4;
+  const int total_units = tasks * split;
+  const int mchunks = std::min(default_pool().size(), total_units);
   float* conv_states[2] = {conv_a, conv_b};
   float* ssm_states[2] = {ssm_a, ssm_b};
 
   {
     Timer slot(profile_enabled() ? &profile().mamba_conv : nullptr);
-    default_pool().parallel_for(tasks * split, [&](int unit) {
+    default_pool().parallel_for(mchunks, [&](int cid) {
+      const int u0 = static_cast<int>(static_cast<int64_t>(total_units) * cid / mchunks);
+      const int u1 = static_cast<int>(static_cast<int64_t>(total_units) * (cid + 1) / mchunks);
+      for (int unit = u0; unit < u1; ++unit) {
       const int task = unit / split;
       const int part = unit % split;
       const int lane_idx = task / tasks_each;
@@ -1763,7 +1767,7 @@ void Model::mamba_layer_pair(const MambaLayer& l, const float* x, int rows_each,
           4 * static_cast<int>(static_cast<int64_t>(c_groups) * part / split);
       const int c1 = 4 * static_cast<int>(static_cast<int64_t>(c_groups) *
                                           (part + 1) / split);
-      if (c1 <= c0) return;
+      if (c1 <= c0) continue;
       const int channels = c1 - c0;
       float* ext = slab_ext + static_cast<size_t>(task) * ext_stride;
       float* cstate = conv_states[lane_idx];
@@ -1808,6 +1812,7 @@ void Model::mamba_layer_pair(const MambaLayer& l, const float* x, int rows_each,
                       ext + static_cast<size_t>(len + j) * inner + c0,
                       sizeof(float) * static_cast<size_t>(channels));
       }
+      }
     });
   }
 
@@ -1826,7 +1831,10 @@ void Model::mamba_layer_pair(const MambaLayer& l, const float* x, int rows_each,
         ssm_b == nullptr && !l.a_log2e8_16.empty() && (inner % 8 == 0);
     const int align_c = use_f16_scan ? 8 : 4;
     const int scan_groups = inner / align_c;
-    default_pool().parallel_for(tasks * split, [&](int unit) {
+    default_pool().parallel_for(mchunks, [&](int cid) {
+      const int u0 = static_cast<int>(static_cast<int64_t>(total_units) * cid / mchunks);
+      const int u1 = static_cast<int>(static_cast<int64_t>(total_units) * (cid + 1) / mchunks);
+      for (int unit = u0; unit < u1; ++unit) {
       const int task = unit / split;
       const int part = unit % split;
       const int lane_idx = task / tasks_each;
@@ -1837,7 +1845,7 @@ void Model::mamba_layer_pair(const MambaLayer& l, const float* x, int rows_each,
       const int c1 = align_c * static_cast<int>(
                                    static_cast<int64_t>(scan_groups) *
                                    (part + 1) / split);
-      if (c1 <= c0) return;
+      if (c1 <= c0) continue;
       float* sstate = ssm_states[lane_idx];
       float* h = sstate != nullptr
                      ? sstate + static_cast<size_t>(local_task) * state_stride
@@ -1859,6 +1867,7 @@ void Model::mamba_layer_pair(const MambaLayer& l, const float* x, int rows_each,
                      sc.xp.data() + row0 * dt_total,
                      sc.y.data() + row0 * inner,
                      len, inner, state, dt_rank, dt_total, c0, c1);
+      }
     });
   }
 

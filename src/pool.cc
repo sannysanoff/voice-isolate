@@ -10,6 +10,9 @@
 #include <thread>
 
 #if defined(__APPLE__)
+#include <mach/thread_act.h>
+#include <mach/thread_policy.h>
+#include <pthread.h>
 #include <pthread/qos.h>
 #endif
 
@@ -117,6 +120,19 @@ constexpr int kSpinRounds = 20000;
 
 }  // namespace
 
+#if defined(__APPLE__)
+// Hint XNU to place threads with different tags on separate L2 cache domains
+// (= the two P-core / SME2 clusters on M4 Max), avoiding intra-cluster SME2
+// arbiter collisions during 2-chunk GEMM dispatch.
+inline void set_cluster_affinity(int tag) {
+  thread_affinity_policy_data_t policy = {tag};
+  thread_policy_set(pthread_mach_thread_np(pthread_self()),
+                    THREAD_AFFINITY_POLICY,
+                    reinterpret_cast<thread_policy_t>(&policy),
+                    THREAD_AFFINITY_POLICY_COUNT);
+}
+#endif
+
 // ------------------------------------------------------------------ pool ----
 
 struct Pool::Impl {
@@ -142,9 +158,12 @@ struct Pool::Impl {
   // Sleep tracking counter, isolated on its own cache line.
   alignas(kCacheLine) std::atomic<int> sleepers{0};
 
-  void worker(int worker_id) {
+  void worker(int worker_id, int total_threads) {
 #if defined(__APPLE__)
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    set_cluster_affinity(worker_id < (total_threads + 1) / 2 ? 1 : 2);
+#else
+    (void)total_threads;
 #endif
     uint64_t seen = 0;
     for (;;) {
@@ -195,10 +214,11 @@ struct Pool::Impl {
 Pool::Pool(int threads) : impl_(new Impl), threads_(threads < 1 ? 1 : threads) {
 #if defined(__APPLE__)
   pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+  if (threads_ > 1) set_cluster_affinity(1);
 #endif
   impl_->threads.reserve(static_cast<size_t>(threads_ - 1));
   for (int i = 1; i < threads_; ++i)
-    impl_->threads.emplace_back([this, i] { impl_->worker(i); });
+    impl_->threads.emplace_back([this, i] { impl_->worker(i, threads_); });
 }
 
 Pool::~Pool() {

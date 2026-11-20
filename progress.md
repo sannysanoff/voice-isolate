@@ -426,3 +426,134 @@ with CPU time and the wall figures are the median of five runs.
    task-graph over the block would remove most of them, but the dependency chain
    through the 7 blocks is sequential, so the win is bounded by the 2 M-op
    threshold already in place.
+
+
+---
+
+# Session 2: ARM SME2, NEON FP16, `ldaxr+wfe` Pool & Memory Layouts
+
+**Date:** 2026-11-20, 07:11 – 08:39 CET  
+**Machine:** Apple M4 Max (`Mac16,6`), 10 P-cores in two 5-core L2 clusters (16 MB L2 per cluster, 128-byte cache lines) + 4 E-cores. CPU only (no Metal/GPU).  
+**Starting point (re-measured 07:11 CET on `/tmp/short5.wav`, 6 threads):**
+- `fp32`: 13.21 s wall / 58.21 s user (0.38× realtime); 44.29 s prior final: **111.9 s wall** (0.40× RT) / **417.8 s user** (9.43 CPU-s/audio-s).
+- `int8`: 8.58 s wall / 32.40 s user (0.58× realtime); 44.29 s prior final: **67.7 s wall** (0.66× RT) / **240.2 s user** (5.42 CPU-s/audio-s).
+- Original baseline (44.29 s, 8 thr, fp32): **163.5 s wall / 456 s user** (0.27× RT, 10.3 CPU-s/audio-s).
+
+## Hardware probe & microbenchmarks (07:12 – 07:20 CET)
+
+`sysctl hw.optional.arm` confirmed full ARMv9 SME2 and NEON FP16/FHM support:
+- `FEAT_SME: 1`, `FEAT_SME2: 1`, `sme_max_svl_b: 64` (512-bit streaming vector length -> 16×16 `ZA32` tiles)
+- `SME_F32F32: 1`, `SME_F16F32: 1`, `SME_B16F32: 1`, `SME_I8I32: 1`, `SME_I16I32: 1` (note: no `SME_F16F16`)
+- `FEAT_FP16: 1`, `FEAT_FHM: 1`, `FEAT_BF16: 1`, `FEAT_I8MM: 1`, `FEAT_DotProd: 1`
+- Important compiler finding: `-march=native` on Apple Clang 17 does **not** enable SME2 or NEON FP16 vector arithmetic; explicit per-file flags (`-march=armv8.7-a+sme+sme2+fp16+bf16` on `src/gemm_sme.cc` and `-march=armv8.7-a+fp16+fp16fml` on `src/vecmath.cc`) with CMake `check_cxx_source_compiles` + runtime `sysctlbyname("hw.optional.arm.FEAT_SME2")` gating are required so portable builds stay unaffected.
+
+Isolated GEMM microbenchmarks on representative shape `184 × 512 × 2048` (streaming 16 weight matrices to exceed L2 = "cold" vs single matrix = "warm"):
+
+| kernel | 1-thread warm | 1-thread cold | notes |
+|---|---|---|---|
+| Apple Accelerate `cblas_sgemm` (reference) | 950 GFLOP/s | — | 1424 GFLOP/s default multi-thread |
+| SME2 `FMOPA` fp32 (`svmopa_za32_f32_m`) | 1147 GFLOP/s | 992 GFLOP/s | 2×2 ZA tiles (32×32), 2× K-unroll, ZA bias init |
+| SME2 `FMOPA` fp16->f32 (`svmopa_za32_f16_m`) | 1153 GFLOP/s | 1090 GFLOP/s | same FP32 accum rate as f32; +10% cold from 2× smaller weights |
+| SME2 `FMOPA` bf16->f32 (`svmopa_za32_bf16_m`) | 1150 GFLOP/s | 1105 GFLOP/s | same FP32 accum rate |
+| SME2 `SMOPA` i16->i32 (`svmopa_za32_s16_m`) | 1151 GOPS/s | — | same accumulator rate as f32 -> not worth implementing |
+| SME2 `SMOPA` i8->i32 (`svmopa_za32_s8_m`) | 1885 GOPS/s | 1833 GOPS/s | 1.85× faster cold; 4-vec `svread_hor_za32_s32_vg4` epilogue |
+
+## Chronological change log (07:20 – 08:35 CET)
+
+### 9. ARM SME2 matrix engine & pre-packed panel layouts (`src/gemm_sme.h`, `src/gemm_sme.cc`, `CMakeLists.txt`, `src/model.cc`) — 07:22 CET
+
+- Added full SME2 GEMM engine supporting `fp32`, `fp16`, `bf16`, `int8`, and `int8g` (`--quant MODE` in `apps/vi_cli.cc`).
+- Pre-packed weight layouts (`Model::prepack_weights()`, eagerly packed in parallel at load/mode switch):
+  - `fp32`: `[ceil(N/16)][K][16]`
+  - `fp16` / `bf16`: `[ceil(N/16)][K/2][16][2]`
+  - `int8` / `int8g`: `[ceil(N/16)][K/4][16][4]` + per-row (or per-group) scales
+- Activation packing uses hardware ZA-tile 16×16 transpose (`sme_pack_a_f32`: 5.44 µs, `sme_pack_a_f16`: 3.99 µs on `184×512`).
+- Micro-kernels: M-outer 32×32 (2×2 ZA tiles) with 2× K-unrolling, 16×64 (1×4 ZA tiles) tail for `M <= 16` (crucial for dual-lane `M = 368 = 11×32 + 16`), zero-overhead bias via ZA initialization (`svwrite_hor_za32` + direct `svst1_hor_za32`), and SME2 4-vector ZA reads (`svread_hor_za32_s32_vg4`) in the `int8` epilogue (+35% epilogue speed, 1332 -> 1804 GOPS/s 1-thr).
+- **2-SME cluster cap (`max_sme_chunks = 2`, overridable via `VI_SME_CHUNKS`):** M4 Max has 2 SME2 units (1 per 5-core P-cluster). Running > 2 threads in SME2 simultaneously causes intra-cluster SME arbiter/ZA contention (measured on 5 s `fp16`: `chunks=2` -> `gemm 1.26 s`, `chunks=3` -> `2.71 s`, `chunks=4` -> `2.11 s`). Capping SME GEMM to 2 chunks while running NEON passes on 8 threads is optimal.
+
+### 10. Low-power ARM64 `ldaxr+wfe` thread pool, 128-byte padding & cluster affinity (`src/pool.cc`) — 07:32 & 08:27 CET
+
+- Isolated `job/count/generation`, `next`, `pending`, and `sleepers` on separate `alignas(128)` cache lines (Apple Silicon L2 cache line size = 128 B).
+- Replaced busy `yield` spinning with ARM64 userspace `ldaxr + wfe` event waiting (`wait_for_change_u64` / `wait_for_nonzero_i32`), cutting 8-thread barrier latency from **~55 µs -> 1.45 µs** with near-zero power/thermal throttling.
+- Added static dispatch when `n <= threads_` (eliminating `next.fetch_add(1)` contention) and strided peer selection (`worker 0` + `worker threads_-1`) for `n == 2`.
+- Lowered `kMinParallelOps` from `2'000'000` to `150'000` on `aarch64` (LayerNorm on 5 s clip dropped 0.20 s -> 0.04 s) and raised default macOS thread count to `min(cores, 8)`.
+- **Cluster affinity fix (08:27 CET):** without explicit cluster separation, macOS XNU occasionally scheduled both `chunks=2` SME workers onto the same 5-core P-cluster, dropping GEMM by 2.8× (`fp32` 1.43 s -> 4.05 s on 5 s clip). Setting `THREAD_AFFINITY_POLICY` (tag `1` on main thread + first half of workers, tag `2` on second half including `stride_peer = threads - 1`) eliminated SME collisions completely (10/10 microbench trials and 9/9 CLI runs collision-free).
+- **Accounting note on `user` CPU time:** macOS counts hardware `wfe` naps inside `user` time even though waiting cores draw near-zero power. Therefore, honest compute cost below is reported from **1-thread `user` time** alongside **8-thread wall-clock realtime**.
+
+### 11. Fast NEON vector math & register-resident Mamba scan (`src/vecmath.h`, `src/vecmath.cc`, `src/model.cc`) — 07:45 & 08:16 CET
+
+- Added hand-tuned NEON fp32 kernels for `v_exp` (1.7e-7), `v_gelu` (zero-cancellation degree-7 Chebyshev `erfc`, 5.1e-7), `v_silu` (1.3e-7), `v_softplus` (1.7e-7), `v_mul_exp` (3.5e-7), `v_quantize_i8` (`vcvtaq_s32_f32` + `vqmovn`), and `v_softmax_norm`.
+- **`v_mamba_scan` (fp32):** 2-pass 8-state register-resident NEON scan (zero register spills) over pre-scaled `a_log2e4` (`[inner/4][state][4]`) and transposed `ssm_state` (`[bands][inner/4][state][4]`), using `vfmaq_laneq_f32`, FMA exponent assembly (`vcvtq_s32_f32(vfmaq_f32(127*2^23, n, 2^23))`), and an unbiased degree-6 `2^f` polynomial (`c0 = 1.0f`, max err `2.6e-9`).
+- **`v_mamba_scan_f16` (stateless `freq_mamba` only):** 8-wide NEON FP16 scan (`4.34 G exp/s` single-core), enabled in non-`fp32` quant modes **only** for stateless `freq_mamba` (`ssm_state == nullptr`, `len = 46`, reset every frame). `time_mamba` stays in fp32 to eliminate cumulative decay-rounding drift (see failed experiments below).
+- **`v_conv4_silu`:** fused 4-tap depthwise conv1d + bias + SiLU; `MambaState::conv` re-laid out to `[bands][taps][inner]` for contiguous `memcpy`.
+- **`v_quant_pack_a_i8_block`:** multi-core NEON 4×4 transposed activation quant+pack across all 8 P-cores for `int8` SME2 (cut 5 s `int8` GEMM from **1.31 s -> 0.77 s**).
+
+### 12. Batched 4-query attention, FP16 KV cache (`FEAT_FHM`), zero-alloc decode & dual-lane crossfade batching (`src/model.cc`, `src/stream.cc`, `src/vecmath.cc`) — 07:55 – 08:34 CET
+
+- **`v_attn4_qk` & `v_attn4_pv`:** 4-query batched NEON micro-kernels (4×4 QK and L1-tiled `kJTile=128` 4-way `vfmaq_laneq_f32` PV) used in both `time_transformer` (reads KV cache 1× per 4 frames instead of 4×) and `band_transformer`.
+- **FP16 KV cache (`--fp16-kv`; auto-enabled for `--quant fp16|bf16|int8`, opt-in for `fp32`):**
+  - `v_attn4_qk_f16` uses `FEAT_FHM` widening `vfmlalq_low_f16` / `vfmlalq_high_f16` (FP16 storage + FP32 accumulation).
+  - `v_attn4_pv_f16` uses `vfmlalq_lane_low_f16` / `vfmlalq_lane_high_f16` (FP16 `V` + FP16 softmax weights -> FP32 accumulation, eliminating all `vcvt_f32_f16` in the inner loop). Single-thread 5 s `pv` dropped from **0.60 s (fp32 KV) -> 0.33 s (fp16 KV)** while keeping **72.11 dB SNR vs fp32** and halving KV cache RAM.
+- **Static `bands × heads` load balancing in `time_transformer` / `time_transformer_pair`:** replaced dynamic `parallel_for(46)` (6 vs 5 bands = 17% straggler tail on 8 threads) with static chunking over `46 × 8 = 368` (`46` exact per thread; `92` exact in dual-lane) and 6× smaller `sc.scores` buffer. Same static chunking applied to `mamba_layer` / `mamba_layer_pair`.
+- **Zero-alloc NEON decode:** stack scratch buffers (zero heap allocations for `frames <= 4`) + direct 4-row NEON `v_linear_4rows`.
+- **Crossfade dual-lane batching (`Model::backbone_pair` & `decode_pair`):** during the 200/600 crossfade window (~1/3 of long audio), both lanes are stacked into `M = 2 × 184 = 368`, halving weight reads and barriers.
+
+## What was tried and discarded (or fixed) in Session 2
+
+- **N-outer SME2 loop + `svread_hor_za32` bias epilogue:** 48% slower than M-outer + `svwrite_hor_za32` bias init + direct `svst1_hor_za32` (769 vs 1140 GFLOP/s).
+- **Degree-5 minimax `exp2` (`c0 = 1.000000075f`) in `v_mamba_scan`:** `c0 > 1.0` biased slow-decaying channels over 2000 steps, failing `plain20` at 91.4 dB (< 100 dB gate). Replaced with unbiased degree-6 `exp2` (`c0 = 1.0f`, max err `2.6e-9`) -> `plain20` restored to **108.5 dB**.
+- **FP16 scan on carried `time_mamba`:** IEEE fp16 rounds `decay > 0.99976` to `1.0`, causing temporal drift on 44.29 s `fp16` from 52.5 dB (0–4 s) down to 10.3 dB (32–36 s; 17.82 dB overall). Restricting `v_mamba_scan_f16` to stateless `freq_mamba` (`ssm_state == nullptr`) restored **55.62–56.45 dB** with zero drift across all 44 s (every 4 s window 50–70 dB).
+- **Pure FP16 accumulation (`vfmaq_f16`) in `v_attn4_qk_f16` / `v_attn4_pv_f16`:** dropped `fp32+kv16` SNR to 44.46 dB. Switching to `FEAT_FHM` widening FP32 accumulation (`vfmlalq_*`) restored **72.11 dB** at virtually identical speed.
+- **Multi-core NEON A-packing for `fp32`/`fp16`/`bf16`:** SME2 hardware ZA transpose (`sme_pack_a_f16` = 3.99 µs, `sme_pack_a_f32` = 5.44 µs) is 2.5–3× faster than NEON 4×4 transpose (10.02 / 16.08 µs), and waking 8 cores dirtied `ap` across both clusters (`fp16` 1.30 s vs 1.20 s). Kept single-thread hardware ZA packing for `f32`/`f16`/`bf16` and 8-core NEON packing only for `int8`.
+- **Splitting `time_mamba` channels across 4 tasks (`46 × 4 = 184`)**: hurt cache locality on `sc.xp` and `ext`, regressing `scan` 0.40 -> 0.45 s (`fp32`) and 0.24 -> 0.32 s (`fp16`). Kept `split = 1` for `time_mamba` with static 8-chunk dispatch.
+- **Per-group int8 (`--quant int8g`, `group_size = 64`):** improved `int8` SNR by +10.1 dB (22.66 -> 32.76 dB on 5 s clip), but draining ZA 8–32× per tile slowed 5 s clip to 5.37 s — strictly dominated by `fp16` (2.15 s, 58.0 dB). Kept as opt-in CLI flag for reference.
+- **Hybrid int8 + fp16 residual-output projections (`proj_w`, `out_w`, `f1w`, `bl2w`, `mamba.out_w`):** measured 23.13 dB vs pure `int8` 23.64 dB (no gain because the remaining ~60 int8 layers still floor SNR near ~22 dB). Removed to keep the CLI clean.
+- **Larger `--block-frames` (8, 16):** 2.31 s (bf=8) and 2.45 s (bf=16) vs 2.35 s (bf=4) on 5 s `fp16` (~1–2% noise); kept default `block_frames = 4`.
+
+## Re-verification of the Session 2 final binary (2026-11-20 08:35:46 – 08:39:07 CET)
+
+All measurements below were run back-to-back on the final clean build (zero warnings):
+
+| check | result |
+|---|---|
+| `cmake --build build -j4` | clean, zero warnings (SME2 + NEON FP16 enabled) |
+| `./build/vi_tests . quick` | all tests passed, output samples **117.5 dB** (max `7.75e-7`) |
+| `ctest --test-dir build` | **1/1 passed in 62.14 s** (down from 236.72 s — **3.81× faster**; `ref1`: 117.5 dB, `win10`: 113.5 dB, `plain20`: 108.5 dB) |
+| sample counts (44.29 s) | 2 125 746 vs 2 125 746 |
+
+### True compute cost (5 s clip, 1 thread — zero `wfe` accounting distortion)
+
+| mode | 1-thr wall | 1-thr user | CPU-s / audio-s | vs prior fp32 (38.36 s) |
+|---|---|---|---|---|
+| Prior `progress.md` fp32 (1 thr) | 38.95 s | 38.36 s | 7.67× | 1.00× |
+| **`fp32` (SME2)** | **8.14 s** | **8.01 s** | **1.60×** | **4.79× less compute** |
+| **`fp32 + fp16-kv`** | **7.59 s** | **7.52 s** | **1.50×** | **5.10× less compute** |
+| **`fp16` (SME2 + kv16 + freq-f16)** | **6.64 s** | **6.58 s** | **1.32×** | **5.83× less compute** |
+| **`bf16` (SME2 + kv16 + freq-f16)** | **6.89 s** | **6.75 s** | **1.35×** | **5.68× less compute** |
+| **`int8` (SME2 + kv16 + freq-f16)** | **6.12 s** | **6.09 s** | **1.22×** | **6.30× less compute** |
+
+### Wall-clock throughput & accuracy (8 threads, final binary)
+
+| workload / mode | wall | realtime | vs orig baseline (163.5 s) | vs prior `progress.md` | SNR vs `clean2.wav` | SNR vs `fp32` |
+|---|---|---|---|---|---|---|
+| 5 s, `fp32` | 2.75 s | **1.82×** | — | 3.92× (vs 10.78 s) | — | ref |
+| 5 s, `fp32 + fp16-kv` | 2.52 s | **1.98×** | — | 4.28× | — | 72.67 dB |
+| 5 s, `fp16` | 2.15 s | **2.32×** | — | 5.01× | — | 58.00 dB |
+| 5 s, `bf16` | 2.16 s | **2.31×** | — | 4.99× | — | — |
+| 5 s, `int8` | 1.71 s | **2.93×** | — | 3.80× (vs 6.5 s) | — | 23.37 dB |
+| **44.29 s, `fp32` (default)** | **30.44 s** | **1.45×** | **5.37×** | **3.68×** (vs 111.9 s) | **69.71 dB** (max `6.10e-5`) | ref |
+| **44.29 s, `fp32 + fp16-kv`** | **27.37 s** | **1.62×** | **5.97×** | **4.09×** | **68.50 dB** (max `2.75e-4`) | **72.11 dB** |
+| **44.29 s, `fp16`** | **23.53 s** *(22.19 s cool)* | **1.88×** *(2.00×)* | **6.95×** *(7.37×)* | **4.76×** | **55.58 dB** (max `1.98e-3`) | **55.62 dB** |
+| **44.29 s, `bf16`** | **24.05 s** | **1.84×** | **6.80×** | **4.65×** | **45.38 dB** (max `9.77e-3`) | **45.39 dB** |
+| **44.29 s, `int8`** | **18.87 s** | **2.35×** | **8.66×** | **3.59×** (vs 67.7 s) | **19.94 dB** (max `1.49e-1`) | **19.93 dB** |
+
+### Where the remaining time goes (44.29 s, 8 threads)
+
+- **`fp32` (30.44 s):** GEMM 14.34 s (47%), Mamba scan 4.35 s (14%), attention QK+PV+ortho ~5.5 s (18%), decode 0.56 s, conv 0.51 s, LN 0.47 s, transpose 0.44 s, add 0.41 s, RoPE 0.34 s.
+- **`fp16` (23.53 s):** GEMM 12.21 s (52%), attention QK+PV+ortho ~3.5 s (15%), Mamba scan 2.55 s (11%), decode 0.53 s, conv 0.47 s, LN 0.43 s, transpose 0.40 s, add 0.35 s, RoPE 0.19 s.
+- **`int8` (18.87 s):** GEMM 7.77 s (41%), attention QK+PV+ortho ~3.3 s (17%), Mamba scan 2.52 s (13%), decode 0.52 s, conv 0.44 s, transpose 0.43 s, LN 0.38 s, add 0.37 s, RoPE 0.17 s.
+
+All three operating points now run comfortably faster than realtime on CPU alone:
+- **Reference quality:** default `--quant fp32` (**1.45× realtime**, 117.5 dB vs Python float32, ~70 dB vs PCM16) or `--quant fp32 --fp16-kv` (**1.62× realtime**, 72.1 dB vs fp32, half KV RAM).
+- **Best speed/quality sweet spot:** `--quant fp16` (**1.88–2.00× realtime**, **55.6 dB** vs fp32, zero temporal drift).
+- **Maximum CPU throughput:** `--quant int8` (**2.35× realtime** on 44.29 s / **2.93× realtime** on 5 s, 19.9 dB vs fp32).
