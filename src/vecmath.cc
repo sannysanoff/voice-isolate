@@ -1663,12 +1663,289 @@ void v_attn1_pv_f16(const float* __restrict s, float inv,
       a2 = vfmaq_n_f32(a2, vcvt_f32_f16(vget_low_f16(h1)), w);
       a3 = vfmaq_n_f32(a3, vcvt_f32_f16(vget_high_f16(h1)), w);
     }
-    vst1q_f32(o + d + 0, a0);  vst1q_f32(o + d + 4, a1);
+    vst1q_f32(o + d + 0, a0);  vst1q_f32(o + d + 1 * 4, a1);
     vst1q_f32(o + d + 8, a2);  vst1q_f32(o + d + 12, a3);
   }
 #else
   (void)s; (void)inv; (void)values_u; (void)n; (void)hd; (void)o;
 #endif
+}
+
+// ------------------------------------------------- x86 int8 KV cache ----
+
+bool kv_i8_available() {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+  static const bool av = __builtin_cpu_supports("avx2") &&
+                         __builtin_cpu_supports("fma");
+  return av;
+#else
+  return false;
+#endif
+}
+
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+namespace {
+
+// Scalar row quantize (fallback + tails): symmetric per-token scale.
+inline void quantize_kv_row_scalar(const float* src, int8_t* dst, int n,
+                                   float* scale) {
+  float peak = 0.0f;
+  for (int i = 0; i < n; ++i) peak = std::max(peak, std::fabs(src[i]));
+  const float s = peak > 0.0f ? peak / 127.0f : 1.0f;
+  *scale = s;
+  const float inv = 1.0f / s;
+  for (int i = 0; i < n; ++i) {
+    int q = static_cast<int>(std::nearbyint(src[i] * inv));
+    dst[i] = static_cast<int8_t>(std::min(127, std::max(-127, q)));
+  }
+}
+
+// Horizontal sum of 8 floats.
+VI_SCAN_AVX2 inline float hsum8(__m256 v) {
+  __m128 lo = _mm256_castps256_ps128(v);
+  __m128 hi = _mm256_extractf128_ps(v, 1);
+  __m128 s = _mm_add_ps(lo, hi);
+  s = _mm_hadd_ps(s, s);
+  s = _mm_hadd_ps(s, s);
+  return _mm_cvtss_f32(s);
+}
+
+// Dequantize 8 int8 -> 8 fp32, scaled.
+VI_SCAN_AVX2 inline __m256 dequant8(const int8_t* p, __m256 ksc) {
+  __m128i b8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
+  __m256i i32 = _mm256_cvtepi8_epi32(b8);
+  return _mm256_mul_ps(_mm256_cvtepi32_ps(i32), ksc);
+}
+
+VI_SCAN_AVX2 void quantize_kv_row_avx2(const float* src, int8_t* dst, int n,
+                                       float* scale) {
+  const __m256 sign = _mm256_set1_ps(-0.0f);
+  __m256 vmax = _mm256_setzero_ps();
+  int i = 0;
+  for (; i + 8 <= n; i += 8)
+    vmax = _mm256_max_ps(
+        vmax, _mm256_andnot_ps(sign, _mm256_loadu_ps(src + i)));
+  alignas(32) float mx[8];
+  _mm256_store_ps(mx, vmax);
+  float peak = 0.0f;
+  for (int t = 0; t < 8; ++t) peak = std::max(peak, mx[t]);
+  for (; i < n; ++i) peak = std::max(peak, std::fabs(src[i]));
+  const float s = peak > 0.0f ? peak / 127.0f : 1.0f;
+  *scale = s;
+  const __m256 vinv = _mm256_set1_ps(1.0f / s);
+  i = 0;
+  for (; i + 8 <= n; i += 8) {
+    __m256 v = _mm256_mul_ps(_mm256_loadu_ps(src + i), vinv);
+    __m256i q = _mm256_cvtps_epi32(v);
+    __m128i lo = _mm256_castsi256_si128(q);
+    __m128i hi = _mm256_extracti128_si256(q, 1);
+    __m128i p16 = _mm_packs_epi32(lo, hi);
+    __m128i p8 = _mm_packs_epi16(p16, _mm_setzero_si128());
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + i), p8);
+  }
+  for (; i < n; ++i) {
+    int q = static_cast<int>(std::nearbyint(src[i] / s));
+    dst[i] = static_cast<int8_t>(std::min(127, std::max(-127, q)));
+  }
+}
+
+VI_SCAN_AVX2 void attn4_qk_i8_avx2(const float* q0, const float* q1,
+                                   const float* q2, const float* q3,
+                                   const int8_t* keys, const float* kscales,
+                                   int n, int hd, float gscale, float* s0,
+                                   float* s1, float* s2, float* s3) {
+  for (int j = 0; j < n; ++j) {
+    const int8_t* kj = keys + static_cast<size_t>(j) * hd;
+    const __m256 ksc = _mm256_broadcast_ss(&kscales[j]);
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+    __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+    int d = 0;
+    for (; d + 8 <= hd; d += 8) {
+      const __m256 k = dequant8(kj + d, ksc);
+      a0 = _mm256_fmadd_ps(_mm256_loadu_ps(q0 + d), k, a0);
+      a1 = _mm256_fmadd_ps(_mm256_loadu_ps(q1 + d), k, a1);
+      a2 = _mm256_fmadd_ps(_mm256_loadu_ps(q2 + d), k, a2);
+      a3 = _mm256_fmadd_ps(_mm256_loadu_ps(q3 + d), k, a3);
+    }
+    float r0 = hsum8(a0), r1 = hsum8(a1), r2 = hsum8(a2), r3 = hsum8(a3);
+    for (; d < hd; ++d) {
+      const float kv = static_cast<float>(kj[d]) * kscales[j];
+      r0 += q0[d] * kv; r1 += q1[d] * kv;
+      r2 += q2[d] * kv; r3 += q3[d] * kv;
+    }
+    s0[j] = r0 * gscale; s1[j] = r1 * gscale;
+    s2[j] = r2 * gscale; s3[j] = r3 * gscale;
+  }
+}
+
+VI_SCAN_AVX2 void attn4_pv_i8_avx2(float* p0, float* p1, float* p2,
+                                   float* p3, const int8_t* vals,
+                                   const float* vscales, int n, int hd,
+                                   float* o0, float* o1, float* o2,
+                                   float* o3) {
+  // Fold the per-key value scales into the weights once up front, so the hot
+  // inner loop needs no scale broadcast/mul. The p buffers hold per-batch
+  // post-softmax weights and are never reused after PV.
+  {
+    int j = 0;
+    for (; j + 8 <= n; j += 8) {
+      const __m256 vs = _mm256_loadu_ps(vscales + j);
+      _mm256_storeu_ps(p0 + j, _mm256_mul_ps(_mm256_loadu_ps(p0 + j), vs));
+      _mm256_storeu_ps(p1 + j, _mm256_mul_ps(_mm256_loadu_ps(p1 + j), vs));
+      _mm256_storeu_ps(p2 + j, _mm256_mul_ps(_mm256_loadu_ps(p2 + j), vs));
+      _mm256_storeu_ps(p3 + j, _mm256_mul_ps(_mm256_loadu_ps(p3 + j), vs));
+    }
+    for (; j < n; ++j) {
+      p0[j] *= vscales[j]; p1[j] *= vscales[j];
+      p2[j] *= vscales[j]; p3[j] *= vscales[j];
+    }
+  }
+  int d = 0;
+  const int dend = hd & ~15;
+  for (; d < dend; d += 16) {
+    __m256 a00 = _mm256_setzero_ps(), a01 = _mm256_setzero_ps();
+    __m256 a10 = _mm256_setzero_ps(), a11 = _mm256_setzero_ps();
+    __m256 a20 = _mm256_setzero_ps(), a21 = _mm256_setzero_ps();
+    __m256 a30 = _mm256_setzero_ps(), a31 = _mm256_setzero_ps();
+    for (int j = 0; j < n; ++j) {
+      const int8_t* vj = vals + static_cast<size_t>(j) * hd + d;
+      __m128i b16 = _mm_loadu_si128(
+          reinterpret_cast<const __m128i*>(vj));
+      __m256 v0 =
+          _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b16));
+      __m256 v1 = _mm256_cvtepi32_ps(
+          _mm256_cvtepi8_epi32(_mm_srli_si128(b16, 8)));
+      const __m256 w0 = _mm256_broadcast_ss(p0 + j);
+      const __m256 w1 = _mm256_broadcast_ss(p1 + j);
+      const __m256 w2 = _mm256_broadcast_ss(p2 + j);
+      const __m256 w3 = _mm256_broadcast_ss(p3 + j);
+      a00 = _mm256_fmadd_ps(w0, v0, a00);
+      a01 = _mm256_fmadd_ps(w0, v1, a01);
+      a10 = _mm256_fmadd_ps(w1, v0, a10);
+      a11 = _mm256_fmadd_ps(w1, v1, a11);
+      a20 = _mm256_fmadd_ps(w2, v0, a20);
+      a21 = _mm256_fmadd_ps(w2, v1, a21);
+      a30 = _mm256_fmadd_ps(w3, v0, a30);
+      a31 = _mm256_fmadd_ps(w3, v1, a31);
+    }
+    _mm256_storeu_ps(o0 + d + 0, a00);
+    _mm256_storeu_ps(o0 + d + 8, a01);
+    _mm256_storeu_ps(o1 + d + 0, a10);
+    _mm256_storeu_ps(o1 + d + 8, a11);
+    _mm256_storeu_ps(o2 + d + 0, a20);
+    _mm256_storeu_ps(o2 + d + 8, a21);
+    _mm256_storeu_ps(o3 + d + 0, a30);
+    _mm256_storeu_ps(o3 + d + 8, a31);
+  }
+  for (; d < hd; ++d) {
+    float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+    for (int j = 0; j < n; ++j) {
+      const float v =
+          static_cast<float>(vals[static_cast<size_t>(j) * hd + d]);
+      a0 += p0[j] * v; a1 += p1[j] * v;
+      a2 += p2[j] * v; a3 += p3[j] * v;
+    }
+    o0[d] = a0; o1[d] = a1; o2[d] = a2; o3[d] = a3;
+  }
+}
+
+}  // namespace
+#endif
+
+void v_quantize_kv_row(const float* src, int8_t* dst, int n, float* scale) {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+  if (kv_i8_available()) {
+    quantize_kv_row_avx2(src, dst, n, scale);
+    return;
+  }
+#endif
+  quantize_kv_row_scalar(src, dst, n, scale);
+}
+
+void v_attn4_qk_i8(const float* q0, const float* q1, const float* q2,
+                   const float* q3, const int8_t* keys, const float* kscales,
+                   int n, int hd, float scale, float* s0, float* s1,
+                   float* s2, float* s3) {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+  if (kv_i8_available()) {
+    attn4_qk_i8_avx2(q0, q1, q2, q3, keys, kscales, n, hd, scale, s0, s1, s2,
+                     s3);
+    return;
+  }
+#endif
+  for (int j = 0; j < n; ++j) {
+    const int8_t* kj = keys + static_cast<size_t>(j) * hd;
+    double r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+    for (int dd = 0; dd < hd; ++dd) {
+      const float kv = static_cast<float>(kj[dd]) * kscales[j];
+      r0 += q0[dd] * kv; r1 += q1[dd] * kv;
+      r2 += q2[dd] * kv; r3 += q3[dd] * kv;
+    }
+    s0[j] = static_cast<float>(r0 * scale);
+    s1[j] = static_cast<float>(r1 * scale);
+    s2[j] = static_cast<float>(r2 * scale);
+    s3[j] = static_cast<float>(r3 * scale);
+  }
+}
+
+void v_attn4_pv_i8(float* p0, float* p1, float* p2, float* p3,
+                   const int8_t* values, const float* vscales, int n, int hd,
+                   float* o0, float* o1, float* o2, float* o3) {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+  if (kv_i8_available()) {
+    attn4_pv_i8_avx2(p0, p1, p2, p3, values, vscales, n, hd, o0, o1, o2, o3);
+    return;
+  }
+#endif
+  for (int j = 0; j < n; ++j) {
+    p0[j] *= vscales[j]; p1[j] *= vscales[j];
+    p2[j] *= vscales[j]; p3[j] *= vscales[j];
+  }
+  for (int dd = 0; dd < hd; ++dd) {
+    double a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+    for (int j = 0; j < n; ++j) {
+      const float v =
+          static_cast<float>(values[static_cast<size_t>(j) * hd + dd]);
+      a0 += p0[j] * v; a1 += p1[j] * v;
+      a2 += p2[j] * v; a3 += p3[j] * v;
+    }
+    o0[dd] = static_cast<float>(a0); o1[dd] = static_cast<float>(a1);
+    o2[dd] = static_cast<float>(a2); o3[dd] = static_cast<float>(a3);
+  }
+}
+
+void v_rope_i8_inplace(int8_t* x, float* sc, int hd, const float* cos,
+                       const float* sin, bool inverse) {
+  // Cache-trim path: dequantize, inverse-rotate, requantize. Cold and rare.
+  // hd is small (64); use a stack buffer.
+  float tmp[256];
+  if (hd > 256) {
+    // Fallback for unexpectedly wide heads: rotate in place per pair in fp32
+    // via a heap buffer (should not happen for this checkpoint).
+    std::vector<float> heap(static_cast<size_t>(hd));
+    for (int i = 0; i < hd; ++i)
+      heap[static_cast<size_t>(i)] = static_cast<float>(x[i]) * (*sc);
+    const int half = hd / 2;
+    const float sgn = inverse ? -1.0f : 1.0f;
+    for (int i = 0; i < half; ++i) {
+      const float a = heap[static_cast<size_t>(i)];
+      const float b = heap[static_cast<size_t>(i + half)];
+      heap[static_cast<size_t>(i)] = a * cos[i] - sgn * b * sin[i];
+      heap[static_cast<size_t>(i + half)] = sgn * a * sin[i] + b * cos[i];
+    }
+    v_quantize_kv_row(heap.data(), x, hd, sc);
+    return;
+  }
+  for (int i = 0; i < hd; ++i) tmp[i] = static_cast<float>(x[i]) * (*sc);
+  const int half = hd / 2;
+  const float sgn = inverse ? -1.0f : 1.0f;
+  for (int i = 0; i < half; ++i) {
+    const float a = tmp[i];
+    const float b = tmp[i + half];
+    tmp[i] = a * cos[i] - sgn * b * sin[i];
+    tmp[i + half] = sgn * a * sin[i] + b * cos[i];
+  }
+  v_quantize_kv_row(tmp, x, hd, sc);
 }
 
 }  // namespace vi

@@ -2,6 +2,7 @@
 #pragma once
 
 #include <complex>
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
@@ -36,6 +37,8 @@ struct Rope {
 struct AttnState {
   std::vector<float> k, v;        // [bands][head][capacity][hd] (fp32 KV cache)
   std::vector<uint16_t> k16, v16; // [bands][head][capacity][hd] (fp16 KV cache)
+  std::vector<int8_t> k8, v8;     // [bands][head][capacity][hd] (int8 KV cache)
+  std::vector<float> k8s, v8s;    // [bands][heads][capacity] per-slot scales
   int capacity = 0;
   int end = 0;
 
@@ -45,6 +48,10 @@ struct AttnState {
     v.clear();
     k16.clear();
     v16.clear();
+    k8.clear();
+    v8.clear();
+    k8s.clear();
+    v8s.clear();
     capacity = 0;
     end = 0;
   }
@@ -108,6 +115,10 @@ class Model {
   bool quant_enabled() const { return quant_mode_ != QuantMode::Fp32; }
   void set_fp16_kv(bool on);
   bool fp16_kv() const { return fp16_kv_; }
+  // x86 int8 KV cache (per-token quant, fp32 accumulation). Auto-enabled for
+  // --quant int8 on AVX2+FMA; silently off where unsupported.
+  void set_int8_kv(bool on);
+  bool int8_kv() const { return int8_kv_; }
   void prepack_weights() const;
 
   void init_lane(Lane& lane) const;
@@ -135,6 +146,8 @@ class Model {
                   int bins, std::complex<float>* out) const;
 
   // Optional stage timings (seconds); enabled by the CLI's --profile.
+  // attn_*_w accumulate wall time across all pool workers (atomic), so they
+  // are comparable with the single-threaded attn_scores/attn_pv fields.
   struct Profile {
     double encode = 0, time_attn = 0, band_attn = 0, mamba = 0, decode = 0;
     // Sub-stages, to see what inside the three hot passes actually costs.
@@ -150,6 +163,16 @@ class Model {
     double add = 0;           // residual adds
     double corr = 0;          // spectrum correction + iSTFT
     double ola = 0;           // overlap-add and release
+    double elem = 0;          // GELU/SiLU/softplus elementwise passes
+    double gemm_flops = 0;    // sum of 2*m*k*n over linear_par calls
+  double gemm_fp32_flops = 0;  // ... over the fp32 Eigen fallback path
+  double gemm_quant = 0;       // activation quantization phase (int8 path)
+    std::atomic<double> attn_qk_w{0};    // batched QK dots (all workers)
+    std::atomic<double> attn_soft_w{0};  // softmax + masking (all workers)
+    std::atomic<double> attn_pv_w{0};    // batched PV (all workers)
+    std::atomic<double> attn_ortho_w{0};  // ortho removal (all workers)
+    std::atomic<double> attn_store_w{0};   // rope + KV store per query (all workers)
+    std::atomic<double> elem_w{0};         // GELU/SiLU/softplus elementwise (all workers)
   };
   static Profile& profile();
   static bool& profile_enabled();
@@ -242,6 +265,7 @@ class Model {
   mutable std::unordered_map<const Tensor*, PackedI8Group> sme_i8g_;
   QuantMode quant_mode_ = QuantMode::Fp32;
   bool fp16_kv_ = false;
+  bool int8_kv_ = false;
   Device device_ = Device::Cpu;
   mutable std::unique_ptr<MetalContext> metal_;
   void linear_par(const float* a, int m, int k, int stride, const Tensor& w,

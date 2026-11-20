@@ -3,6 +3,7 @@
 #include <Eigen/Core>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 
@@ -43,14 +44,24 @@ struct Timer {
   }
 };
 
+// Adds a worker-local measurement into a shared atomic profile counter.
+// Workers flush once per parallel_for chunk, so there is no contention.
+inline void prof_add(std::atomic<double>& total, double value) {
+  double old = total.load(std::memory_order_relaxed);
+  while (!total.compare_exchange_weak(old, old + value,
+                                      std::memory_order_relaxed)) {
+  }
+}
+
 constexpr float kPi = 3.14159265358979323846f;
 
-// With ARM64 ldaxr+wfe barriers (~1.5 us), passes above ~150k ops (including
-// LayerNorm on 184x512 = 282k ops) speed up cleanly across cores.
+// x86 barriers stay cheap while workers spin between dense blocks (~1-2 us),
+// so passes above ~100k ops (an add over a single block, a strided transpose)
+// parallelize cleanly. Below that the dispatch costs more than the work.
 #if defined(__aarch64__)
 constexpr int64_t kMinParallelOps = 150'000;
 #else
-constexpr int64_t kMinParallelOps = 2'000'000;
+constexpr int64_t kMinParallelOps = 100'000;
 #endif
 
 // Below this the int8 threshold arithmetic and the extra activation pass cost
@@ -268,9 +279,76 @@ void reserve_slots_f16(AttnState& st, int slots, int limit, int bands,
   st.capacity = capacity;
 }
 
+void reserve_slots_i8(AttnState& st, int slots, int limit, int bands,
+                      int width, int head_dim) {
+  if (slots <= st.capacity) return;
+  int capacity = std::max(slots, std::max(2 * st.capacity, 64));
+  if (capacity > limit) capacity = limit;
+  const int heads = width / head_dim;
+  const size_t old_band = static_cast<size_t>(st.capacity) * width;
+  const size_t new_band = static_cast<size_t>(capacity) * width;
+  std::vector<int8_t> k(static_cast<size_t>(bands) * new_band);
+  std::vector<int8_t> v(k.size());
+  std::vector<float> ks(static_cast<size_t>(bands) * heads * capacity);
+  std::vector<float> vs(ks.size());
+  if (st.end > 0) {
+    const size_t run = sizeof(int8_t) * static_cast<size_t>(st.end) * head_dim;
+    const size_t srun = sizeof(float) * static_cast<size_t>(st.end);
+    for (int b = 0; b < bands; ++b) {
+      for (int h = 0; h < heads; ++h) {
+        const size_t old_at = static_cast<size_t>(b) * old_band +
+                              static_cast<size_t>(h) * st.capacity * head_dim;
+        const size_t new_at = static_cast<size_t>(b) * new_band +
+                              static_cast<size_t>(h) * capacity * head_dim;
+        std::memcpy(k.data() + new_at, st.k8.data() + old_at, run);
+        std::memcpy(v.data() + new_at, st.v8.data() + old_at, run);
+        const size_t old_s = (static_cast<size_t>(b) * heads + h) * st.capacity;
+        const size_t new_s = (static_cast<size_t>(b) * heads + h) * capacity;
+        std::memcpy(ks.data() + new_s, st.k8s.data() + old_s, srun);
+        std::memcpy(vs.data() + new_s, st.v8s.data() + old_s, srun);
+      }
+    }
+  }
+  st.k8.swap(k);
+  st.v8.swap(v);
+  st.k8s.swap(ks);
+  st.v8s.swap(vs);
+  st.capacity = capacity;
+}
+
+// Direct few-row (rows <= 4) linear layer through the 4-query dot kernel:
+// pads to four rows by repeating the last row (padded outputs rewrite that
+// row identically). Used for decode tails where Eigen's overhead dominates.
+inline void linear_tail4(const float* a, int rows, int k, const float* w,
+                         int n, const float* bias, float* c) {
+  const int r1 = std::min(1, rows - 1), r2 = std::min(2, rows - 1),
+            r3 = std::min(3, rows - 1);
+  v_attn4_qk(a, a + static_cast<size_t>(r1) * k, a + static_cast<size_t>(r2) * k,
+             a + static_cast<size_t>(r3) * k, w, n, k, 1.0f, c,
+             c + static_cast<size_t>(r1) * n, c + static_cast<size_t>(r2) * n,
+             c + static_cast<size_t>(r3) * n);
+  for (int r = 0; r < rows; ++r) {
+    float* cr = c + static_cast<size_t>(r) * n;
+    int j = 0;
+    for (; j + vx::lanes <= n; j += vx::lanes)
+      storef(cr + j, loadf(cr + j) + loadf(bias + j));
+    for (; j < n; ++j) cr[j] += bias[j];
+  }
+}
+
 // [bands][frames][width] <-> [frames][bands][width]
 void to_frame_major(const float* feat, float* out, int bands, int frames,
                     int width) {
+  if (worth_splitting(2 * static_cast<int64_t>(bands) * frames * width) &&
+      default_pool().size() > 1) {
+    default_pool().parallel_for(bands, [&](int b) {
+      for (int t = 0; t < frames; ++t)
+        std::memcpy(out + (static_cast<size_t>(t) * bands + b) * width,
+                    feat + (static_cast<size_t>(b) * frames + t) * width,
+                    sizeof(float) * width);
+    });
+    return;
+  }
   for (int b = 0; b < bands; ++b)
     for (int t = 0; t < frames; ++t)
       std::memcpy(out + (static_cast<size_t>(t) * bands + b) * width,
@@ -280,6 +358,16 @@ void to_frame_major(const float* feat, float* out, int bands, int frames,
 
 void to_band_major(const float* in, float* feat, int bands, int frames,
                    int width) {
+  if (worth_splitting(2 * static_cast<int64_t>(bands) * frames * width) &&
+      default_pool().size() > 1) {
+    default_pool().parallel_for(bands, [&](int b) {
+      for (int t = 0; t < frames; ++t)
+        std::memcpy(feat + (static_cast<size_t>(b) * frames + t) * width,
+                    in + (static_cast<size_t>(t) * bands + b) * width,
+                    sizeof(float) * width);
+    });
+    return;
+  }
   for (int b = 0; b < bands; ++b)
     for (int t = 0; t < frames; ++t)
       std::memcpy(feat + (static_cast<size_t>(b) * frames + t) * width,
@@ -408,6 +496,15 @@ void Model::set_fp16_kv(bool on) {
   if (device_ == Device::Metal && metal_) {
     metal_->set_precision(quant_mode_ != QuantMode::Fp32, fp16_kv_);
   }
+}
+
+void Model::set_int8_kv(bool on) {
+#if defined(__x86_64__)
+  int8_kv_ = on && kv_i8_available();
+#else
+  (void)on;
+  int8_kv_ = false;
+#endif
 }
 
 void Model::prepack_weights() const {
@@ -874,6 +971,46 @@ void Model::linear_par_avx2(const float* a, int m, int k, int stride,
   if (sc.q8s.size() < static_cast<size_t>(m)) sc.q8s.resize(m);
   auto* aq = reinterpret_cast<uint8_t*>(sc.q8.data());
   const int threads = default_pool().size();
+  const int ntiles = n / 16;
+  if (threads > 1 && ntiles >= threads) {
+    // Column split: quantize all rows once (row-parallel), then give each
+    // worker a disjoint subset of 16-column tiles over all rows. Weights
+    // stream once instead of once per worker (row split re-reads them
+    // `threads` times); activations are the smaller tensor here.
+    const int tiles = (m - 1) / 4 + 1;
+    const int qchunks = std::min(threads, tiles);
+    const auto qboundary = [&](int chunk) {
+      const int64_t tile = static_cast<int64_t>(tiles) * chunk / qchunks;
+      return static_cast<int>(std::min<int64_t>(m, 4 * tile));
+    };
+    default_pool().parallel_for(qchunks, [&](int index) {
+      const int r0 = qboundary(index), r1 = qboundary(index + 1);
+      quantize_avx2_rows(a + static_cast<size_t>(r0) * stride, r1 - r0, k,
+                         stride, aq + static_cast<size_t>(r0) * k,
+                         sc.q8s.data() + r0);
+    });
+    const int gchunks = std::min(threads, ntiles);
+    double l_qq = 0;
+    {
+      Timer tq(profile_enabled() ? &l_qq : nullptr);
+      default_pool().parallel_for(qchunks, [&](int index) {
+        const int r0 = qboundary(index), r1 = qboundary(index + 1);
+        quantize_avx2_rows(a + static_cast<size_t>(r0) * stride, r1 - r0, k,
+                           stride, aq + static_cast<size_t>(r0) * k,
+                           sc.q8s.data() + r0);
+      });
+    }
+    default_pool().parallel_for(gchunks, [&](int index) {
+      const int t0 =
+          static_cast<int>(static_cast<int64_t>(ntiles) * index / gchunks);
+      const int t1 = static_cast<int>(static_cast<int64_t>(ntiles) * (index + 1) /
+                                      gchunks);
+      if (t1 > t0)
+        gemm_avx2_tiles(aq, sc.q8s.data(), m, it->second, bias, c, t0, t1);
+    });
+    if (profile_enabled()) profile().gemm_quant += l_qq;
+    return;
+  }
   // Give each worker whole four-row tiles and private activation scratch.
   const int tiles = (m - 1) / 4 + 1;
   const int chunks = std::min(threads, tiles);
@@ -931,11 +1068,14 @@ bool Model::linear_par_i8(const float* a, int m, int k, int stride,
 void Model::linear_par(const float* a, int m, int k, int stride, const Tensor& w,
                        const float* bias, float* c) const {
   Timer timer(profile_enabled() ? &profile().gemm : nullptr);
+  if (profile_enabled()) profile().gemm_flops += 2.0 * m * k * w.dim(0);
   if (linear_par_sme(a, m, k, stride, w, bias, c)) return;
   if (linear_par_i8(a, m, k, stride, w, bias, c)) return;
   const int n = w.dim(0);
   const int threads = default_pool().size();
   if (!worth_splitting(2 * static_cast<int64_t>(m) * k * n) || threads == 1) {
+    if (profile_enabled())
+      profile().gemm_fp32_flops += 2.0 * m * k * w.dim(0);
     linear(a, m, k, stride, w, bias, c);
     return;
   }
@@ -947,9 +1087,13 @@ void Model::linear_par(const float* a, int m, int k, int stride, const Tensor& w
   if (chunks <= 1) {
     const int row_chunks = std::min(threads, std::max(1, m / 8));
     if (row_chunks <= 1 || static_cast<int64_t>(n) * k > 1 << 16) {
+      if (profile_enabled())
+        profile().gemm_fp32_flops += 2.0 * m * k * w.dim(0);
       linear(a, m, k, stride, w, bias, c);
       return;
     }
+    if (profile_enabled())
+      profile().gemm_fp32_flops += 2.0 * m * k * w.dim(0);
     default_pool().parallel_for(row_chunks, [&](int index) {
       const int m0 = static_cast<int>(static_cast<int64_t>(m) * index / row_chunks);
       const int m1 =
@@ -961,6 +1105,8 @@ void Model::linear_par(const float* a, int m, int k, int stride, const Tensor& w
     return;
   }
   StridedMap in(a, m, k, Eigen::OuterStride<Eigen::Dynamic>(stride));
+  if (profile_enabled())
+    profile().gemm_fp32_flops += 2.0 * m * k * w.dim(0);
   default_pool().parallel_for(chunks, [&](int index) {
     const int n0 = static_cast<int>(static_cast<int64_t>(n) * index / chunks);
     const int n1 =
@@ -1035,6 +1181,7 @@ void Model::add_par(float* dst, const float* src, int n) const {
 
 void Model::elementwise_par(float* x, int n, void (*fn)(float*, int),
                             int cost_per_element) const {
+  Timer timer(profile_enabled() ? &profile().elem : nullptr);
   if (!worth_splitting(static_cast<int64_t>(n) * cost_per_element)) {
     fn(x, n);
     return;
@@ -1146,6 +1293,7 @@ void Model::time_transformer(const AttnWeights& w, float* feat, int frames,
 
   Timer timer(profile_enabled() ? &profile().time_attn : nullptr);
   const bool use_f16_kv = fp16_kv_ && (hd % 32 == 0) && (hd <= 128);
+  const bool use_i8_kv = int8_kv_ && kv_i8_available();
   int first = st.end;
   {
     Timer slot(profile_enabled() ? &profile().rope : nullptr);
@@ -1159,7 +1307,33 @@ void Model::time_transformer(const AttnWeights& w, float* feat, int frames,
         const float* cos = rope.cos_at(shift);
         const float* sin = rope.sin_at(shift);
         for (int b = 0; b < bands; ++b) {
-          if (use_f16_kv) {
+          if (use_i8_kv) {
+            int8_t* kb =
+                st.k8.data() + static_cast<size_t>(b) * st.capacity * width;
+            int8_t* vb =
+                st.v8.data() + static_cast<size_t>(b) * st.capacity * width;
+            float* kbs =
+                st.k8s.data() + static_cast<size_t>(b) * heads * st.capacity;
+            float* vbs =
+                st.v8s.data() + static_cast<size_t>(b) * heads * st.capacity;
+            for (int h = 0; h < heads; ++h) {
+              int8_t* kh = kb + static_cast<size_t>(h) * lane;
+              float* sh = kbs + static_cast<size_t>(h) * st.capacity;
+              for (int s = 0; s < keep; ++s)
+                v_rope_i8_inplace(kh + static_cast<size_t>(s + shift) * hd,
+                                  sh + s + shift, hd, cos, sin,
+                                  /*inverse=*/true);
+              std::memmove(kh, kh + static_cast<size_t>(shift) * hd,
+                           sizeof(int8_t) * keep * hd);
+              std::memmove(sh, sh + shift, sizeof(float) * keep);
+              std::memmove(vb + static_cast<size_t>(h) * lane,
+                           vb + static_cast<size_t>(h) * lane + shift * hd,
+                           sizeof(int8_t) * keep * hd);
+              std::memmove(vbs + static_cast<size_t>(h) * st.capacity,
+                           vbs + static_cast<size_t>(h) * st.capacity + shift,
+                           sizeof(float) * keep);
+            }
+          } else if (use_f16_kv) {
             uint16_t* kb =
                 st.k16.data() + static_cast<size_t>(b) * st.capacity * width;
             uint16_t* vb =
@@ -1198,7 +1372,9 @@ void Model::time_transformer(const AttnWeights& w, float* feat, int frames,
       }
     }
   }
-  if (use_f16_kv)
+  if (use_i8_kv)
+    reserve_slots_i8(st, first + frames, lp.capacity_limit, bands, width, hd);
+  else if (use_f16_kv)
     reserve_slots_f16(st, first + frames, lp.capacity_limit, bands, width, hd);
   else
     reserve_slots(st, first + frames, lp.capacity_limit, bands, width, hd);
@@ -1222,6 +1398,7 @@ void Model::time_transformer(const AttnWeights& w, float* feat, int frames,
     const int u0 = static_cast<int>(static_cast<int64_t>(total_bh) * cid / achunks);
     const int u1 = static_cast<int>(static_cast<int64_t>(total_bh) * (cid + 1) / achunks);
     float* scores_base = sc.scores.data() + static_cast<size_t>(cid) * 4 * score_stride;
+    double l_qk = 0, l_soft = 0, l_pv = 0, l_ortho = 0, l_store = 0;
     for (int u = u0; u < u1; ++u) {
       const int b = u / heads;
       const int h = u % heads;
@@ -1229,8 +1406,13 @@ void Model::time_transformer(const AttnWeights& w, float* feat, int frames,
       float* vbase = use_f16_kv ? nullptr : st.v.data() + static_cast<size_t>(b) * st.capacity * width;
       uint16_t* k16base = use_f16_kv ? st.k16.data() + static_cast<size_t>(b) * st.capacity * width : nullptr;
       uint16_t* v16base = use_f16_kv ? st.v16.data() + static_cast<size_t>(b) * st.capacity * width : nullptr;
+      int8_t* k8base = use_i8_kv ? st.k8.data() + static_cast<size_t>(b) * st.capacity * width : nullptr;
+      int8_t* v8base = use_i8_kv ? st.v8.data() + static_cast<size_t>(b) * st.capacity * width : nullptr;
+      float* k8sbase = use_i8_kv ? st.k8s.data() + static_cast<size_t>(b) * heads * st.capacity : nullptr;
+      float* v8sbase = use_i8_kv ? st.v8s.data() + static_cast<size_t>(b) * heads * st.capacity : nullptr;
 
       for (int t = 0; t < frames; ++t) {
+        Timer tsl(profile_enabled() ? &l_store : nullptr);
         const int pos = first + t;
         float* row = sc.qkv.data() + static_cast<size_t>(b * frames + t) * 3 * width;
         const float* cos = rope.cos_at(pos);
@@ -1242,7 +1424,12 @@ void Model::time_transformer(const AttnWeights& w, float* feat, int frames,
         rope_head(k, hd, cos, sin, false);
         const size_t slot_off =
             static_cast<size_t>(h) * lane_stride + static_cast<size_t>(pos) * hd;
-        if (use_f16_kv) {
+        if (use_i8_kv) {
+          const size_t sc_off =
+              static_cast<size_t>(h) * st.capacity + pos;
+          v_quantize_kv_row(k, k8base + slot_off, hd, k8sbase + sc_off);
+          v_quantize_kv_row(v, v8base + slot_off, hd, v8sbase + sc_off);
+        } else if (use_f16_kv) {
           v_f32_to_f16(k, k16base + slot_off, hd);
           v_f32_to_f16(v, v16base + slot_off, hd);
         } else {
@@ -1280,12 +1467,22 @@ void Model::time_transformer(const AttnWeights& w, float* feat, int frames,
 
         {
           Timer slot(pf_single ? &profile().attn_scores : nullptr);
-          if (use_f16_kv)
+          Timer wl_qk(profile_enabled() ? &l_qk : nullptr);
+          if (use_i8_kv)
+            v_attn4_qk_i8(r0 + h * hd, r1 + h * hd, r2 + h * hd, r3 + h * hd,
+                          k8base + head_slot,
+                          k8sbase + static_cast<size_t>(h) * st.capacity +
+                              span_lo,
+                          n_span, hd, scale, s0, s1, s2, s3);
+          else if (use_f16_kv)
             v_attn4_qk_f16(r0 + h * hd, r1 + h * hd, r2 + h * hd, r3 + h * hd,
                            k16base + head_slot, n_span, hd, scale, s0, s1, s2, s3);
           else
             v_attn4_qk(r0 + h * hd, r1 + h * hd, r2 + h * hd, r3 + h * hd,
                        kbase + head_slot, n_span, hd, scale, s0, s1, s2, s3);
+        }
+        {
+          Timer wl_soft(profile_enabled() ? &l_soft : nullptr);
           for (int r = 0; r < 4; ++r) {
             const int st_r = lo[r] - span_lo;
             const int en_r = pos[r] - span_lo + 1;
@@ -1296,7 +1493,13 @@ void Model::time_transformer(const AttnWeights& w, float* feat, int frames,
         }
         {
           Timer slot(pf_single ? &profile().attn_pv : nullptr);
-          if (use_f16_kv)
+          Timer wl_pv(profile_enabled() ? &l_pv : nullptr);
+          if (use_i8_kv)
+            v_attn4_pv_i8(s0, s1, s2, s3, v8base + head_slot,
+                          v8sbase + static_cast<size_t>(h) * st.capacity +
+                              span_lo,
+                          n_span, hd, o0, o1, o2, o3);
+          else if (use_f16_kv)
             v_attn4_pv_f16(s0, s1, s2, s3, v16base + head_slot, n_span, hd,
                            o0, o1, o2, o3);
           else
@@ -1306,6 +1509,7 @@ void Model::time_transformer(const AttnWeights& w, float* feat, int frames,
         float* optrs[4] = {o0, o1, o2, o3};
         const float* vptrs[4] = {r0 + 2 * width + h * hd, r1 + 2 * width + h * hd,
                                  r2 + 2 * width + h * hd, r3 + 2 * width + h * hd};
+        Timer wl_ortho(profile_enabled() ? &l_ortho : nullptr);
         for (int r = 0; r < 4; ++r) {
           const float dot_v = dot(optrs[r], vptrs[r], hd);
           const float norm_v = dot(vptrs[r], vptrs[r], hd);
@@ -1313,40 +1517,99 @@ void Model::time_transformer(const AttnWeights& w, float* feat, int frames,
           axpy(optrs[r], -coef, vptrs[r], hd);
         }
       }
-
-      for (int t = t0; t < frames; ++t) {
-        const int pos = first + t;
-        const float* row = sc.qkv.data() + static_cast<size_t>(b * frames + t) * 3 * width;
-        float* o = sc.attn.data() + static_cast<size_t>(b * frames + t) * width + h * hd;
-        int lo = past_lo;
-        if (lp.window > 0) lo = std::max(lo, pos - lp.window + 1);
-        const int n = pos - lo + 1;
+      if (t0 < frames) {
+        // Remainder frames (< 4): pad to a batch of four by repeating the last
+        // frame, so the shared key/value window streams once instead of once
+        // per frame. Padded queries reproduce the last frame's scores/outputs
+        // and harmlessly rewrite them; only the first `rem` outputs are
+        // post-processed (the ortho step is not idempotent, so it must skip
+        // the padding).
+        const int rem = frames - t0;
+        int pos[4], lo[4];
+        for (int r = 0; r < 4; ++r) {
+          const int rr = std::min(r, rem - 1);
+          pos[r] = first + t0 + rr;
+          lo[r] = past_lo;
+          if (lp.window > 0) lo[r] = std::max(lo[r], pos[r] - lp.window + 1);
+        }
+        const int span_lo = lo[0];
+        const int n_span = pos[3] - span_lo + 1;
         const size_t head_slot =
-            static_cast<size_t>(h) * lane_stride + static_cast<size_t>(lo) * hd;
-        const float* q = row + h * hd;
-        float* s = scores_base;
-        float sum;
+            static_cast<size_t>(h) * lane_stride + static_cast<size_t>(span_lo) * hd;
+
+        const float* r0 = sc.qkv.data() + static_cast<size_t>(b * frames + t0 + std::min(0, rem - 1)) * 3 * width;
+        const float* r1 = sc.qkv.data() + static_cast<size_t>(b * frames + t0 + std::min(1, rem - 1)) * 3 * width;
+        const float* r2 = sc.qkv.data() + static_cast<size_t>(b * frames + t0 + std::min(2, rem - 1)) * 3 * width;
+        const float* r3 = sc.qkv.data() + static_cast<size_t>(b * frames + t0 + std::min(3, rem - 1)) * 3 * width;
+        float* o0 = sc.attn.data() + static_cast<size_t>(b * frames + t0 + std::min(0, rem - 1)) * width + h * hd;
+        float* o1 = sc.attn.data() + static_cast<size_t>(b * frames + t0 + std::min(1, rem - 1)) * width + h * hd;
+        float* o2 = sc.attn.data() + static_cast<size_t>(b * frames + t0 + std::min(2, rem - 1)) * width + h * hd;
+        float* o3 = sc.attn.data() + static_cast<size_t>(b * frames + t0 + std::min(3, rem - 1)) * width + h * hd;
+        float* s0 = scores_base + 0 * score_stride;
+        float* s1 = scores_base + 1 * score_stride;
+        float* s2 = scores_base + 2 * score_stride;
+        float* s3 = scores_base + 3 * score_stride;
+        float* sptrs[4] = {s0, s1, s2, s3};
+
         {
           Timer slot(pf_single ? &profile().attn_scores : nullptr);
-          if (use_f16_kv)
-            sum = v_attn1_scores_softmax_f16(q, k16base + head_slot, n, hd, scale, s);
+          Timer wl_qk(profile_enabled() ? &l_qk : nullptr);
+          if (use_i8_kv)
+            v_attn4_qk_i8(r0 + h * hd, r1 + h * hd, r2 + h * hd, r3 + h * hd,
+                          k8base + head_slot,
+                          k8sbase + static_cast<size_t>(h) * st.capacity +
+                              span_lo,
+                          n_span, hd, scale, s0, s1, s2, s3);
+          else if (use_f16_kv)
+            v_attn4_qk_f16(r0 + h * hd, r1 + h * hd, r2 + h * hd, r3 + h * hd,
+                           k16base + head_slot, n_span, hd, scale, s0, s1, s2, s3);
           else
-            sum = scores_softmax(q, kbase + head_slot, n, hd, scale, s);
+            v_attn4_qk(r0 + h * hd, r1 + h * hd, r2 + h * hd, r3 + h * hd,
+                       kbase + head_slot, n_span, hd, scale, s0, s1, s2, s3);
         }
-        const float inv = 1.0f / sum;
+        {
+          Timer wl_soft(profile_enabled() ? &l_soft : nullptr);
+          for (int r = 0; r < 4; ++r) {
+            const int st_r = lo[r] - span_lo;
+            const int en_r = pos[r] - span_lo + 1;
+            v_softmax_norm(sptrs[r] + st_r, en_r - st_r);
+            for (int z = 0; z < st_r; ++z) sptrs[r][z] = 0.0f;
+            for (int z = en_r; z < n_span; ++z) sptrs[r][z] = 0.0f;
+          }
+        }
         {
           Timer slot(pf_single ? &profile().attn_pv : nullptr);
-          if (use_f16_kv)
-            v_attn1_pv_f16(s, inv, v16base + head_slot, n, hd, o);
+          Timer wl_pv(profile_enabled() ? &l_pv : nullptr);
+          if (use_i8_kv)
+            v_attn4_pv_i8(s0, s1, s2, s3, v8base + head_slot,
+                          v8sbase + static_cast<size_t>(h) * st.capacity +
+                              span_lo,
+                          n_span, hd, o0, o1, o2, o3);
+          else if (use_f16_kv)
+            v_attn4_pv_f16(s0, s1, s2, s3, v16base + head_slot, n_span, hd,
+                           o0, o1, o2, o3);
           else
-            pv_row(s, inv, vbase + head_slot, n, hd, o);
+            v_attn4_pv(s0, s1, s2, s3, vbase + head_slot, n_span, hd,
+                       o0, o1, o2, o3);
         }
-        const float* v = row + 2 * width + h * hd;
-        const float dot_v = dot(o, v, hd);
-        const float norm_v = dot(v, v, hd);
-        const float coef = dot_v / std::max(norm_v, 1e-6f);
-        axpy(o, -coef, v, hd);
+        float* optrs[4] = {o0, o1, o2, o3};
+        const float* vptrs[4] = {r0 + 2 * width + h * hd, r1 + 2 * width + h * hd,
+                                 r2 + 2 * width + h * hd, r3 + 2 * width + h * hd};
+        Timer wl_ortho(profile_enabled() ? &l_ortho : nullptr);
+        for (int r = 0; r < rem; ++r) {
+          const float dot_v = dot(optrs[r], vptrs[r], hd);
+          const float norm_v = dot(vptrs[r], vptrs[r], hd);
+          const float coef = dot_v / std::max(norm_v, 1e-6f);
+          axpy(optrs[r], -coef, vptrs[r], hd);
+        }
       }
+    }
+    if (profile_enabled()) {
+      prof_add(profile().attn_qk_w, l_qk);
+      prof_add(profile().attn_soft_w, l_soft);
+      prof_add(profile().attn_pv_w, l_pv);
+      prof_add(profile().attn_ortho_w, l_ortho);
+      prof_add(profile().attn_store_w, l_store);
     }
   });
   st.end = first + frames;
@@ -1378,6 +1641,7 @@ void Model::time_transformer_pair(const AttnWeights& w, float* pair_feat,
 
   Timer timer(profile_enabled() ? &profile().time_attn : nullptr);
   const bool use_f16_kv = fp16_kv_ && (hd % 32 == 0) && (hd <= 128);
+  const bool use_i8_kv = int8_kv_ && kv_i8_available();
   auto prep_state = [&](AttnState& st) -> int {
     int first = st.end;
     if (first + frames > lp.capacity_limit) {
@@ -1388,7 +1652,33 @@ void Model::time_transformer_pair(const AttnWeights& w, float* pair_feat,
         const float* cos = rope.cos_at(shift);
         const float* sin = rope.sin_at(shift);
         for (int b = 0; b < bands; ++b) {
-          if (use_f16_kv) {
+          if (use_i8_kv) {
+            int8_t* kb =
+                st.k8.data() + static_cast<size_t>(b) * st.capacity * width;
+            int8_t* vb =
+                st.v8.data() + static_cast<size_t>(b) * st.capacity * width;
+            float* kbs =
+                st.k8s.data() + static_cast<size_t>(b) * heads * st.capacity;
+            float* vbs =
+                st.v8s.data() + static_cast<size_t>(b) * heads * st.capacity;
+            for (int h = 0; h < heads; ++h) {
+              int8_t* kh = kb + static_cast<size_t>(h) * lane;
+              float* sh = kbs + static_cast<size_t>(h) * st.capacity;
+              for (int s = 0; s < keep; ++s)
+                v_rope_i8_inplace(kh + static_cast<size_t>(s + shift) * hd,
+                                  sh + s + shift, hd, cos, sin,
+                                  /*inverse=*/true);
+              std::memmove(kh, kh + static_cast<size_t>(shift) * hd,
+                           sizeof(int8_t) * keep * hd);
+              std::memmove(sh, sh + shift, sizeof(float) * keep);
+              std::memmove(vb + static_cast<size_t>(h) * lane,
+                           vb + static_cast<size_t>(h) * lane + shift * hd,
+                           sizeof(int8_t) * keep * hd);
+              std::memmove(vbs + static_cast<size_t>(h) * st.capacity,
+                           vbs + static_cast<size_t>(h) * st.capacity + shift,
+                           sizeof(float) * keep);
+            }
+          } else if (use_f16_kv) {
             uint16_t* kb =
                 st.k16.data() + static_cast<size_t>(b) * st.capacity * width;
             uint16_t* vb =
@@ -1426,7 +1716,9 @@ void Model::time_transformer_pair(const AttnWeights& w, float* pair_feat,
         first = keep;
       }
     }
-    if (use_f16_kv)
+    if (use_i8_kv)
+      reserve_slots_i8(st, first + frames, lp.capacity_limit, bands, width, hd);
+    else if (use_f16_kv)
       reserve_slots_f16(st, first + frames, lp.capacity_limit, bands, width, hd);
     else
       reserve_slots(st, first + frames, lp.capacity_limit, bands, width, hd);
@@ -1459,6 +1751,7 @@ void Model::time_transformer_pair(const AttnWeights& w, float* pair_feat,
     const int u1 = static_cast<int>(static_cast<int64_t>(total_bh) * (cid + 1) / achunks);
     float* scores_base =
         sc.scores.data() + static_cast<size_t>(cid) * 4 * score_stride;
+    double l_qk = 0, l_soft = 0, l_pv = 0, l_ortho = 0, l_store = 0;
     for (int u = u0; u < u1; ++u) {
       const int lane_idx = u / bh_per_lane;
       const int rem = u % bh_per_lane;
@@ -1472,9 +1765,14 @@ void Model::time_transformer_pair(const AttnWeights& w, float* pair_feat,
       float* vbase = use_f16_kv ? nullptr : st.v.data() + static_cast<size_t>(b) * st.capacity * width;
       uint16_t* k16base = use_f16_kv ? st.k16.data() + static_cast<size_t>(b) * st.capacity * width : nullptr;
       uint16_t* v16base = use_f16_kv ? st.v16.data() + static_cast<size_t>(b) * st.capacity * width : nullptr;
+      int8_t* k8base = use_i8_kv ? st.k8.data() + static_cast<size_t>(b) * st.capacity * width : nullptr;
+      int8_t* v8base = use_i8_kv ? st.v8.data() + static_cast<size_t>(b) * st.capacity * width : nullptr;
+      float* k8sbase = use_i8_kv ? st.k8s.data() + static_cast<size_t>(b) * heads * st.capacity : nullptr;
+      float* v8sbase = use_i8_kv ? st.v8s.data() + static_cast<size_t>(b) * heads * st.capacity : nullptr;
       const size_t row_off = static_cast<size_t>(lane_idx) * rows;
 
       for (int t = 0; t < frames; ++t) {
+        Timer tsl(profile_enabled() ? &l_store : nullptr);
         const int pos = first + t;
         float* row = sc.qkv.data() +
                      (row_off + static_cast<size_t>(b * frames + t)) * 3 * width;
@@ -1487,7 +1785,12 @@ void Model::time_transformer_pair(const AttnWeights& w, float* pair_feat,
         rope_head(k, hd, cos, sin, false);
         const size_t slot_off =
             static_cast<size_t>(h) * lane_stride + static_cast<size_t>(pos) * hd;
-        if (use_f16_kv) {
+        if (use_i8_kv) {
+          const size_t sc_off =
+              static_cast<size_t>(h) * st.capacity + pos;
+          v_quantize_kv_row(k, k8base + slot_off, hd, k8sbase + sc_off);
+          v_quantize_kv_row(v, v8base + slot_off, hd, v8sbase + sc_off);
+        } else if (use_f16_kv) {
           v_f32_to_f16(k, k16base + slot_off, hd);
           v_f32_to_f16(v, v16base + slot_off, hd);
         } else {
@@ -1523,28 +1826,49 @@ void Model::time_transformer_pair(const AttnWeights& w, float* pair_feat,
         float* s3 = scores_base + 3 * score_stride;
         float* sptrs[4] = {s0, s1, s2, s3};
 
-        if (use_f16_kv)
-          v_attn4_qk_f16(r0 + h * hd, r1 + h * hd, r2 + h * hd, r3 + h * hd,
-                         k16base + head_slot, n_span, hd, scale, s0, s1, s2, s3);
-        else
-          v_attn4_qk(r0 + h * hd, r1 + h * hd, r2 + h * hd, r3 + h * hd,
-                     kbase + head_slot, n_span, hd, scale, s0, s1, s2, s3);
-        for (int r = 0; r < 4; ++r) {
-          const int st_r = lo[r] - span_lo;
-          const int en_r = pos[r] - span_lo + 1;
-          v_softmax_norm(sptrs[r] + st_r, en_r - st_r);
-          for (int z = 0; z < st_r; ++z) sptrs[r][z] = 0.0f;
-          for (int z = en_r; z < n_span; ++z) sptrs[r][z] = 0.0f;
+        {
+          Timer wl_qk(profile_enabled() ? &l_qk : nullptr);
+          if (use_i8_kv)
+            v_attn4_qk_i8(r0 + h * hd, r1 + h * hd, r2 + h * hd, r3 + h * hd,
+                          k8base + head_slot,
+                          k8sbase + static_cast<size_t>(h) * st.capacity +
+                              span_lo,
+                          n_span, hd, scale, s0, s1, s2, s3);
+          else if (use_f16_kv)
+            v_attn4_qk_f16(r0 + h * hd, r1 + h * hd, r2 + h * hd, r3 + h * hd,
+                           k16base + head_slot, n_span, hd, scale, s0, s1, s2, s3);
+          else
+            v_attn4_qk(r0 + h * hd, r1 + h * hd, r2 + h * hd, r3 + h * hd,
+                       kbase + head_slot, n_span, hd, scale, s0, s1, s2, s3);
         }
-        if (use_f16_kv)
-          v_attn4_pv_f16(s0, s1, s2, s3, v16base + head_slot, n_span, hd,
-                         o0, o1, o2, o3);
-        else
-          v_attn4_pv(s0, s1, s2, s3, vbase + head_slot, n_span, hd,
-                     o0, o1, o2, o3);
+        {
+          Timer wl_soft(profile_enabled() ? &l_soft : nullptr);
+          for (int r = 0; r < 4; ++r) {
+            const int st_r = lo[r] - span_lo;
+            const int en_r = pos[r] - span_lo + 1;
+            v_softmax_norm(sptrs[r] + st_r, en_r - st_r);
+            for (int z = 0; z < st_r; ++z) sptrs[r][z] = 0.0f;
+            for (int z = en_r; z < n_span; ++z) sptrs[r][z] = 0.0f;
+          }
+        }
+        {
+          Timer wl_pv(profile_enabled() ? &l_pv : nullptr);
+          if (use_i8_kv)
+            v_attn4_pv_i8(s0, s1, s2, s3, v8base + head_slot,
+                          v8sbase + static_cast<size_t>(h) * st.capacity +
+                              span_lo,
+                          n_span, hd, o0, o1, o2, o3);
+          else if (use_f16_kv)
+            v_attn4_pv_f16(s0, s1, s2, s3, v16base + head_slot, n_span, hd,
+                           o0, o1, o2, o3);
+          else
+            v_attn4_pv(s0, s1, s2, s3, vbase + head_slot, n_span, hd,
+                       o0, o1, o2, o3);
+        }
         float* optrs[4] = {o0, o1, o2, o3};
         const float* vptrs[4] = {r0 + 2 * width + h * hd, r1 + 2 * width + h * hd,
                                  r2 + 2 * width + h * hd, r3 + 2 * width + h * hd};
+        Timer wl_ortho(profile_enabled() ? &l_ortho : nullptr);
         for (int r = 0; r < 4; ++r) {
           const float dot_v = dot(optrs[r], vptrs[r], hd);
           const float norm_v = dot(vptrs[r], vptrs[r], hd);
@@ -1552,33 +1876,98 @@ void Model::time_transformer_pair(const AttnWeights& w, float* pair_feat,
           axpy(optrs[r], -coef, vptrs[r], hd);
         }
       }
-      for (int t = t0; t < frames; ++t) {
-        const int pos = first + t;
-        const float* row = sc.qkv.data() +
-                           (row_off + static_cast<size_t>(b * frames + t)) * 3 * width;
-        float* o = sc.attn.data() +
-                   (row_off + static_cast<size_t>(b * frames + t)) * width + h * hd;
-        int lo = past_lo;
-        if (lp.window > 0) lo = std::max(lo, pos - lp.window + 1);
-        const int n = pos - lo + 1;
+      if (t0 < frames) {
+        // Remainder frames (< 4): pad to a batch of four by repeating the last
+        // frame, so the shared key/value window streams once instead of once
+        // per frame. Padded queries reproduce the last frame's scores/outputs
+        // and harmlessly rewrite them; only the first `rem` outputs are
+        // post-processed (the ortho step is not idempotent, so it must skip
+        // the padding).
+        const int rem = frames - t0;
+        int pos[4], lo[4];
+        for (int r = 0; r < 4; ++r) {
+          const int rr = std::min(r, rem - 1);
+          pos[r] = first + t0 + rr;
+          lo[r] = past_lo;
+          if (lp.window > 0) lo[r] = std::max(lo[r], pos[r] - lp.window + 1);
+        }
+        const int span_lo = lo[0];
+        const int n_span = pos[3] - span_lo + 1;
         const size_t head_slot =
-            static_cast<size_t>(h) * lane_stride + static_cast<size_t>(lo) * hd;
-        const float* q = row + h * hd;
-        float* s = scores_base;
-        const float sum = use_f16_kv
-                              ? v_attn1_scores_softmax_f16(q, k16base + head_slot, n, hd, scale, s)
-                              : scores_softmax(q, kbase + head_slot, n, hd, scale, s);
-        const float inv = 1.0f / sum;
-        if (use_f16_kv)
-          v_attn1_pv_f16(s, inv, v16base + head_slot, n, hd, o);
-        else
-          pv_row(s, inv, vbase + head_slot, n, hd, o);
-        const float* v = row + 2 * width + h * hd;
-        const float dot_v = dot(o, v, hd);
-        const float norm_v = dot(v, v, hd);
-        const float coef = dot_v / std::max(norm_v, 1e-6f);
-        axpy(o, -coef, v, hd);
+            static_cast<size_t>(h) * lane_stride + static_cast<size_t>(span_lo) * hd;
+        const size_t qbase = row_off + static_cast<size_t>(b * frames + t0);
+        const float* r0 = sc.qkv.data() + (qbase + static_cast<size_t>(std::min(0, rem - 1))) * 3 * width;
+        const float* r1 = sc.qkv.data() + (qbase + static_cast<size_t>(std::min(1, rem - 1))) * 3 * width;
+        const float* r2 = sc.qkv.data() + (qbase + static_cast<size_t>(std::min(2, rem - 1))) * 3 * width;
+        const float* r3 = sc.qkv.data() + (qbase + static_cast<size_t>(std::min(3, rem - 1))) * 3 * width;
+        const size_t obase = row_off + static_cast<size_t>(b * frames + t0);
+        float* o0 = sc.attn.data() + (obase + static_cast<size_t>(std::min(0, rem - 1))) * width + h * hd;
+        float* o1 = sc.attn.data() + (obase + static_cast<size_t>(std::min(1, rem - 1))) * width + h * hd;
+        float* o2 = sc.attn.data() + (obase + static_cast<size_t>(std::min(2, rem - 1))) * width + h * hd;
+        float* o3 = sc.attn.data() + (obase + static_cast<size_t>(std::min(3, rem - 1))) * width + h * hd;
+        float* s0 = scores_base + 0 * score_stride;
+        float* s1 = scores_base + 1 * score_stride;
+        float* s2 = scores_base + 2 * score_stride;
+        float* s3 = scores_base + 3 * score_stride;
+        float* sptrs[4] = {s0, s1, s2, s3};
+
+        {
+          Timer wl_qk(profile_enabled() ? &l_qk : nullptr);
+          if (use_i8_kv)
+            v_attn4_qk_i8(r0 + h * hd, r1 + h * hd, r2 + h * hd, r3 + h * hd,
+                          k8base + head_slot,
+                          k8sbase + static_cast<size_t>(h) * st.capacity +
+                              span_lo,
+                          n_span, hd, scale, s0, s1, s2, s3);
+          else if (use_f16_kv)
+            v_attn4_qk_f16(r0 + h * hd, r1 + h * hd, r2 + h * hd, r3 + h * hd,
+                           k16base + head_slot, n_span, hd, scale, s0, s1, s2, s3);
+          else
+            v_attn4_qk(r0 + h * hd, r1 + h * hd, r2 + h * hd, r3 + h * hd,
+                       kbase + head_slot, n_span, hd, scale, s0, s1, s2, s3);
+        }
+        {
+          Timer wl_soft(profile_enabled() ? &l_soft : nullptr);
+          for (int r = 0; r < 4; ++r) {
+            const int st_r = lo[r] - span_lo;
+            const int en_r = pos[r] - span_lo + 1;
+            v_softmax_norm(sptrs[r] + st_r, en_r - st_r);
+            for (int z = 0; z < st_r; ++z) sptrs[r][z] = 0.0f;
+            for (int z = en_r; z < n_span; ++z) sptrs[r][z] = 0.0f;
+          }
+        }
+        {
+          Timer wl_pv(profile_enabled() ? &l_pv : nullptr);
+          if (use_i8_kv)
+            v_attn4_pv_i8(s0, s1, s2, s3, v8base + head_slot,
+                          v8sbase + static_cast<size_t>(h) * st.capacity +
+                              span_lo,
+                          n_span, hd, o0, o1, o2, o3);
+          else if (use_f16_kv)
+            v_attn4_pv_f16(s0, s1, s2, s3, v16base + head_slot, n_span, hd,
+                           o0, o1, o2, o3);
+          else
+            v_attn4_pv(s0, s1, s2, s3, vbase + head_slot, n_span, hd,
+                       o0, o1, o2, o3);
+        }
+        float* optrs[4] = {o0, o1, o2, o3};
+        const float* vptrs[4] = {r0 + 2 * width + h * hd, r1 + 2 * width + h * hd,
+                                 r2 + 2 * width + h * hd, r3 + 2 * width + h * hd};
+        Timer wl_ortho(profile_enabled() ? &l_ortho : nullptr);
+        for (int r = 0; r < rem; ++r) {
+          const float dot_v = dot(optrs[r], vptrs[r], hd);
+          const float norm_v = dot(vptrs[r], vptrs[r], hd);
+          const float coef = dot_v / std::max(norm_v, 1e-6f);
+          axpy(optrs[r], -coef, vptrs[r], hd);
+        }
       }
+    }
+    if (profile_enabled()) {
+      prof_add(profile().attn_qk_w, l_qk);
+      prof_add(profile().attn_soft_w, l_soft);
+      prof_add(profile().attn_pv_w, l_pv);
+      prof_add(profile().attn_ortho_w, l_ortho);
+      prof_add(profile().attn_store_w, l_store);
     }
   });
   st_a.end = firsts[0] + frames;
@@ -2066,8 +2455,7 @@ void Model::backbone(float* feat, int frames, Lane& lane, const Rope& rope,
                   sc.trans.data(), ms.conv.data(), ms.ssm.data(),
                   sc.mamba_ext.data(), sc.mamba_decay.data(),
                   sc.mamba_h.data());
-      for (size_t k = 0; k < static_cast<size_t>(rows) * width; ++k)
-        sc.trans[k] += feat[k];
+      add_par(sc.trans.data(), feat, rows * width);
       linear_par(sc.trans.data(), rows, width, *block.time_mamba.out_w,
                  block.time_mamba.out_b->data, sc.rev.data());
       layer_norm_par(sc.rev.data(), sc.norm.data(), rows, width,
@@ -2080,7 +2468,7 @@ void Model::backbone(float* feat, int frames, Lane& lane, const Rope& rope,
       mamba_layer(block.freq_mamba.forward, sc.trans.data(), rows, bands,
                   sc.attn.data(), nullptr, nullptr, sc.mamba_ext.data(),
                   sc.mamba_decay.data(), sc.mamba_h.data());
-      for (int f = 0; f < frames; ++f)
+      default_pool().parallel_for(frames, [&](int f) {
         for (int b = 0; b < bands; ++b)
           std::memcpy(
               sc.rev.data() +
@@ -2088,10 +2476,11 @@ void Model::backbone(float* feat, int frames, Lane& lane, const Rope& rope,
               sc.trans.data() + (static_cast<size_t>(f) * bands +
                                  (bands - 1 - b)) * width,
               sizeof(float) * width);
+      });
       mamba_layer(block.freq_mamba.backward, sc.rev.data(), rows, bands,
                   sc.bwd.data(), nullptr, nullptr, sc.mamba_ext.data(),
                   sc.mamba_decay.data(), sc.mamba_h.data());
-      for (int f = 0; f < frames; ++f) {
+      default_pool().parallel_for(frames, [&](int f) {
         for (int b = 0; b < bands; ++b) {
           const size_t row = static_cast<size_t>(f) * bands + b;
           const size_t flipped = static_cast<size_t>(f) * bands + (bands - 1 - b);
@@ -2105,7 +2494,7 @@ void Model::backbone(float* feat, int frames, Lane& lane, const Rope& rope,
             dst1[col] = bwd[col] + tr[col];
           }
         }
-      }
+      });
       linear_par(sc.cat.data(), rows, 2 * width, *block.freq_mamba.out_w,
                  block.freq_mamba.out_b->data, sc.norm.data());
       layer_norm_par(sc.norm.data(), sc.attn.data(), rows, width,
@@ -2200,7 +2589,7 @@ void Model::backbone_pair(float* feat_a, float* feat_b, int frames,
       mamba_layer(block.freq_mamba.forward, sc.trans.data(), rows2, bands,
                   sc.attn.data(), nullptr, nullptr, sc.mamba_ext.data(),
                   sc.mamba_decay.data(), sc.mamba_h.data());
-      for (int f = 0; f < frames2; ++f)
+      default_pool().parallel_for(frames2, [&](int f) {
         for (int b = 0; b < bands; ++b)
           std::memcpy(
               sc.rev.data() +
@@ -2208,10 +2597,11 @@ void Model::backbone_pair(float* feat_a, float* feat_b, int frames,
               sc.trans.data() + (static_cast<size_t>(f) * bands +
                                  (bands - 1 - b)) * width,
               sizeof(float) * width);
+      });
       mamba_layer(block.freq_mamba.backward, sc.rev.data(), rows2, bands,
                   sc.bwd.data(), nullptr, nullptr, sc.mamba_ext.data(),
                   sc.mamba_decay.data(), sc.mamba_h.data());
-      for (int f = 0; f < frames2; ++f) {
+      default_pool().parallel_for(frames2, [&](int f) {
         for (int b = 0; b < bands; ++b) {
           const size_t row = static_cast<size_t>(f) * bands + b;
           const size_t flipped =
@@ -2226,7 +2616,7 @@ void Model::backbone_pair(float* feat_a, float* feat_b, int frames,
             dst1[col] = bwd[col] + tr[col];
           }
         }
-      }
+      });
       linear_par(sc.cat.data(), rows2, 2 * width, *block.freq_mamba.out_w,
                  block.freq_mamba.out_b->data, sc.norm.data());
       layer_norm_par(sc.norm.data(), sc.attn.data(), rows2, width,
@@ -2287,8 +2677,9 @@ void Model::decode(const float* feat, int frames, float* raw) const {
                      head.h1_w->data, width, head.h1_b->data,
                      pp + static_cast<size_t>(r) * width);
     if (r < frames)
-      linear(np + static_cast<size_t>(r) * width, frames - r, width,
-             *head.h1_w, head.h1_b->data, pp + static_cast<size_t>(r) * width);
+      linear_tail4(np + static_cast<size_t>(r) * width, frames - r, width,
+                   head.h1_w->data, width, head.h1_b->data,
+                   pp + static_cast<size_t>(r) * width);
     v_gelu(pp, frames * width);
     r = 0;
     for (; r + 4 <= frames; r += 4)
@@ -2296,8 +2687,9 @@ void Model::decode(const float* feat, int frames, float* raw) const {
                      head.h3_w->data, out_dim, head.h3_b->data,
                      op + static_cast<size_t>(r) * out_dim);
     if (r < frames)
-      linear(pp + static_cast<size_t>(r) * width, frames - r, width,
-             *head.h3_w, head.h3_b->data, op + static_cast<size_t>(r) * out_dim);
+      linear_tail4(pp + static_cast<size_t>(r) * width, frames - r, width,
+                   head.h3_w->data, out_dim, head.h3_b->data,
+                   op + static_cast<size_t>(r) * out_dim);
     for (int t = 0; t < frames; ++t)
       std::memcpy(raw + (static_cast<size_t>(t) * bins + edge.first) * 4,
                   op + static_cast<size_t>(t) * out_dim,
@@ -2358,8 +2750,9 @@ void Model::decode_pair(const float* feat_a, const float* feat_b, int frames,
                      head.h1_w->data, width, head.h1_b->data,
                      pp + static_cast<size_t>(r) * width);
     if (r < frames2)
-      linear(np + static_cast<size_t>(r) * width, frames2 - r, width,
-             *head.h1_w, head.h1_b->data, pp + static_cast<size_t>(r) * width);
+      linear_tail4(np + static_cast<size_t>(r) * width, frames2 - r, width,
+                   head.h1_w->data, width, head.h1_b->data,
+                   pp + static_cast<size_t>(r) * width);
     v_gelu(pp, frames2 * width);
     r = 0;
     for (; r + 4 <= frames2; r += 4)
@@ -2367,8 +2760,9 @@ void Model::decode_pair(const float* feat_a, const float* feat_b, int frames,
                      head.h3_w->data, out_dim, head.h3_b->data,
                      op + static_cast<size_t>(r) * out_dim);
     if (r < frames2)
-      linear(pp + static_cast<size_t>(r) * width, frames2 - r, width,
-             *head.h3_w, head.h3_b->data, op + static_cast<size_t>(r) * out_dim);
+      linear_tail4(pp + static_cast<size_t>(r) * width, frames2 - r, width,
+                   head.h3_w->data, out_dim, head.h3_b->data,
+                   op + static_cast<size_t>(r) * out_dim);
     for (int t = 0; t < frames; ++t) {
       std::memcpy(raw_a + (static_cast<size_t>(t) * bins + edge.first) * 4,
                   op + static_cast<size_t>(t) * out_dim,

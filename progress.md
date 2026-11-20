@@ -655,3 +655,153 @@ Subsequent sustained runs hit severe host throttling. Linux k10temp reported
 benchmarks stopped. The later trials cannot establish a sustained speedup.
 The full int8 quality and timing above precede the final decoder/convolution
 and attention-value loop changes. The Python reference fixtures were absent.
+
+## x86 int8 optimization — Ryzen 7 7435HS (2026-11-20, 8 threads)
+
+Machine: AMD Ryzen 7 7435HS, 8 cores / 16 SMT threads, AVX2+FMA, **no
+AVX-512 / VNNI / fp16**, ~4.2 GHz under load, no thermal throttling during
+runs. GCC 13.3, Release `-O3 -march=native -fno-math-errno`. Source at this
+revision; full 44.29 s WAV, `--quant int8 --threads 8`, window 600 / crossfade
+200. Times are processing time (model load excluded).
+
+| Step | Processing | Realtime | int8 SNR vs matching fp32 |
+|---|---:|---:|---:|
+| Starting build (bf4, pool.cc spin tweak, no inlining) | 51.5 s | 0.86x | 23.32 dB |
+| `tile()` forced `always_inline` | 48.8 s | 0.91x | — |
+| + column-major loop nesting + one-thread-per-core affinity | 44.2 s | 1.00x | 23.32 dB |
+| + default `--block-frames 6` | 41.1-42.4 s | **1.04-1.08x** | 23.40 dB |
+
+Diagnosis: `nm` showed `tile<4>` emitted as a standalone symbol (GCC refused to
+inline the `target("avx2")` function into `gemm_avx2_tiles`), which cost ~37% of
+kernel throughput (187 -> 253 GOPS on 184x512x1536). AVX2 k-unrolling, 8-row
+split tiles, AVX2 attention QK tiling, LTO, and bias-template specialization
+were all tried and gave no gain. Affinity (one worker per physical core) saved
+~2 s; `VI_NO_AFFINITY=1` disables it. Block 8 is faster still (40.0 s, 1.11x)
+but int8 SNR drops to 21.6 dB, so block 6 was chosen as the default.
+
+Output sample count is unchanged (2,125,746). int8 remains a low-precision mode
+(~23 dB against fp32); fp32 is the reference-quality path. ARM/Metal backends
+were not exercised on this host.
+
+### Final verification of the 7435HS binary
+
+Re-run after the last refactor (bias epilogue moved out of the lambda so the
+portable build compiles), machine otherwise idle:
+
+| check | result |
+|---|---|
+| `cmake --build build-opt -j8` (native) | clean |
+| `cmake --build build-portable2 -j8` (`VI_NATIVE=OFF`) | clean |
+| `ctest --test-dir build-opt --output-on-failure` | 1/1 passed |
+| `ctest --test-dir build-portable2 --output-on-failure` | 1/1 passed |
+| `nm` on `gemm_avx2.cc.o` | no standalone `tile<4>` symbol (inlined) |
+| portable CLI, 5 s excerpt, int8, 8 threads | 4.68 s incl. startup |
+| 44.29 s, int8, 8 threads, default bf6 (two runs) | **41.06 / 40.91 s processing = 1.08x** |
+| profiled run | stages 38.64 of 41.35 s; GEMM 16.05, scan 2.93 s |
+| sample count | 2,125,746 (matches `clean2.wav`) |
+| int8 vs matching fp32 bf6 output | 23.40 dB, max 0.09048 |
+| int8 vs `clean2.wav` PCM16 | 23.40 dB, max 0.09051 |
+
+Outputs kept at `/tmp/opencode/F1.wav`, `/tmp/opencode/F2.wav` and
+`/tmp/opencode/FINAL-int8.wav`. The `ref/` fixtures were still absent, so the
+Python stage/windowed/cache-compaction reference checks are skipped rather than
+passed. The handoff document now has a matching final stage with the changed
+bf6 default and reproduction command.
+
+---
+
+## x86 int8 towards 1.9x — session 2026-11-20 (Ryzen 7 7435HS, same host)
+
+Goal: 1.9x realtime (44.29 s audio in <= 23.3 s) on this CPU with the int8
+path. Starting point re-measured: 41.02 s processing, 8 threads, bf6 (1.08x).
+fp32 stays the reference path; int8 is labelled low precision.
+
+Environment caveats (all runs below): `powersave` governor (amd-pstate-epp,
+`balance_performance`), ~2.9 GHz observed under 8-core AVX2 load vs 4.55 GHz
+max; no sudo so the governor cannot be changed. Box is shared (Minecraft JVM,
+Brave, Telegram); loadavg seen 0.84–6.70. `user` CPU time is the stable metric;
+wall moves with ambient load and clocks. Single-thread AVX2 int8 kernel now
+benches 169–259 GOPS shape-dependent (vs 253 on 184x512x1536 at full boost),
+i.e. clocks are derated ~0.67x in this environment.
+
+### Diagnosis added (kept in tree)
+
+- Worker-side atomic accumulators `attn_qk_w / attn_soft_w / attn_pv_w /
+  attn_ortho_w / attn_store_w` (flushed once per pool chunk) + `elem` timer
+  for GELU/softplus/SiLU + `gemm_flops` and `gemm_fp32_flops` counters.
+- Full-file finding: attn math ~31 s CPU (QK 14.4 + PV 11.4 + softmax 4–5),
+  GEMM 16 s wall at ~1380–1425 GFLOPS aggregate (99.9% int8, fp32 fallback
+  only 0.1% of FLOPs), scan 2.9, elem 1.3, LN 1.1, transpose 0.6. GEMM runs
+  at ~85% of the derated single-thread peak, so the ceiling from here is
+  mostly clocks, not kernel efficiency.
+
+### Changes (all measured on 5 s excerpt + full 44.29 s file, 8 threads, bf6)
+
+1. **Remainder batching**: the `frames % 4` tail (2 frames at bf6) ran as
+   single queries reloading the whole 600-key window each. Pad to a 4-batch
+   by repeating the last frame (padded outputs rewrite it identically; only
+   `rem` outputs go through the non-idempotent ortho step). Pair path too.
+   Band tail (window 46) deliberately left as singles: negligible traffic,
+   and score-buffer aliasing would break softmax.
+2. **x86 int8 KV cache** (`--quant int8` auto-enables on AVX2+FMA, explicit
+   `--int8-kv` flag; `--fp16-kv` still forces fp32 KV on x86 for now):
+   per-token symmetric int8 for K and V + one fp32 scale per slot, fp32
+   accumulation in AVX2 QK/PV kernels with on-the-fly dequant; fp32 KV path
+   untouched. Insert quantizes after RoPE; cache-trim path dequantizes,
+   inverse-rotates and requantizes (cold). 5 s clip: QK 1.77->0.89 s CPU,
+   PV 1.94->0.70 s CPU (PV includes a prescale fold of vscale into weights,
+   ~+7%). Quality on 5 s: int8+fp32KV vs fp32 = 24.82 dB; int8+int8KV vs
+   fp32 = 24.51 dB — KV quant costs **0.3 dB** total, far below the 23 dB
+   GEMM floor. Per-token int8 suffices; no Hadamard needed at int8.
+3. **Column-split AVX2 GEMM**: quantize all rows once (row-parallel), then one
+   worker per 16-column tile subset (weights stream 1x instead of 8x).
+   Fallback to the old row split when `n/16 < threads`. Neutral on 5 s
+   (compute-bound shapes), kept for L3 pressure on full file.
+4. **x86 `kMinParallelOps` 2M -> 100k** (barriers ~1-2 us on hot spinning
+   workers): LayerNorm 0.11->0.02 s on 5 s clip.
+5. **Parallel strided moves**: `to_frame_major`/`to_band_major` over bands,
+   mamba reversal + cat over frames (single + pair paths), scalar
+   `sc.trans += feat` -> `add_par`.
+6. **Decode tails**: 1-3 leftover rows via padded `v_attn4_qk` + bias
+   (`linear_tail4`) instead of Eigen. Decode 0.24->0.18 s on 5 s clip.
+
+### Rejected (measured, reverted or not taken)
+
+- Scan as 4 passes of 4 states (register pressure): **slower** (scan
+  0.32->0.40 s on 5 s) — L1-resident spills are nearly free, extra passes
+  add real work. Reverted.
+- Integer PV via `vpmaddubsw`: wrong reduction — madd/maddubs reduce across
+  bytes (group sums), but PV needs per-element outputs. Caught before
+  running; float dequant path kept.
+- Masked band tail: score-buffer aliasing breaks softmax (not idempotent);
+  window-46 traffic negligible anyway. Reverted.
+- fp16 KV on x86: not needed — int8 KV is strictly better here and quality
+  holds; `--fp16-kv` on x86 keeps meaning fp32 KV (documented above).
+- Integer QK dot: needs quantized Q + offset correction via per-key sums
+  (~25% overhead for ~15% uop win) — not worth it.
+- Larger blocks: bf12 38.1 s vs 41.0 s on the old code but int8 SNR
+  23.4->21.6 dB at bf8; not taken (kept bf6 default + comparability).
+- LTO, AVX2 k-unrolling, 8-row tiles, 4/6/7 threads: no gain (prior session,
+  still true).
+
+### Results so far (8 threads, bf6, window 600 / crossfade 200)
+
+| build step (full 44.29 s, int8) | processing | realtime |
+|---|---|---:|
+| session start | 41.02 s | 1.08x |
+| + remainder batch + int8 KV + colsplit + PV fold | 33.72 s | 1.31x |
+| + threshold + parallel moves + decode tails | **31.71 s** | **1.40x** |
+
+5 s excerpt int8: 4.19 s -> 3.22 s (1.55x). `vi_tests quick` passes, `ctest`
+passes; fp32 path outputs unchanged in character (full fp32 re-verify pending
+at the end). int8 quality MUST still be re-verified full-file vs matching
+fp32 and vs `clean2.wav` (5 s: 25.0 dB vs fp32).
+
+One full-file run at 52.25 s was discarded as invalid: a foreground parameter
+sweep ran concurrently and oversubscribed the cores (user 255 s vs 235 s,
+wall/user ratio collapsed). Never benchmark concurrently on this box.
+
+Remaining gap: 31.7 s -> 23.3 s (8.4 s). GEMM is at ~85-95% of the derated
+peak so the rest must come from attention math, scan, decode, data movement
+and quiet-machine clocks. Next: band-QK/PV costs, `bf` re-check with current
+code + quality, quiet-window full-file runs.

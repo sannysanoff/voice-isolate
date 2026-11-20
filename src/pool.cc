@@ -5,9 +5,16 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <thread>
+
+#if defined(__linux__) && (defined(__x86_64__) || defined(__i386__))
+#include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
+#endif
 
 #if defined(__APPLE__)
 #include <mach/thread_act.h>
@@ -135,6 +142,37 @@ inline void set_cluster_affinity(int tag) {
 
 // ------------------------------------------------------------------ pool ----
 
+#if defined(__linux__) && (defined(__x86_64__) || defined(__i386__))
+// Pick one logical CPU per physical core from the process's allowed set. On
+// SMT x86 machines letting the scheduler place all workers freely can stack two
+// of them on one core while another core sits idle; pinning one thread per
+// core measured ~3% faster on an 8-core/16-thread Ryzen with eight workers.
+// Set VI_NO_AFFINITY=1 to disable.
+std::vector<int> one_cpu_per_core(int max) {
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return {};
+  std::vector<int> reps, cores;
+  for (int c = 0; c < CPU_SETSIZE && static_cast<int>(reps.size()) < max; ++c) {
+    if (!CPU_ISSET(c, &allowed)) continue;
+    int core = -1;
+    char path[128], text[64];
+    std::snprintf(path, sizeof(path),
+                  "/sys/devices/system/cpu/cpu%d/topology/core_id", c);
+    if (FILE* f = std::fopen(path, "r")) {
+      if (std::fgets(text, sizeof(text), f)) core = std::atoi(text);
+      std::fclose(f);
+    }
+    if (core >= 0 &&
+        std::find(cores.begin(), cores.end(), core) != cores.end())
+      continue;
+    if (core >= 0) cores.push_back(core);
+    reps.push_back(c);
+  }
+  return reps;
+}
+#endif
+
 struct Pool::Impl {
   std::mutex mutex;
   std::condition_variable wake;
@@ -183,7 +221,12 @@ struct Pool::Impl {
             });
           }
           sleepers.fetch_sub(1, std::memory_order_seq_cst);
+          // On x86 stay parked across timeout checks. Restarting the busy
+          // spin here consumed cores even with no audio arriving. Each new
+          // job starts its own spin budget at the top of the worker loop.
+#if !defined(__x86_64__) && !defined(__i386__)
           spins = 0;
+#endif
         }
       }
       if (stop.load(std::memory_order_relaxed)) return;
@@ -219,6 +262,24 @@ Pool::Pool(int threads) : impl_(new Impl), threads_(threads < 1 ? 1 : threads) {
   impl_->threads.reserve(static_cast<size_t>(threads_ - 1));
   for (int i = 1; i < threads_; ++i)
     impl_->threads.emplace_back([this, i] { impl_->worker(i, threads_); });
+#if defined(__linux__) && (defined(__x86_64__) || defined(__i386__))
+  const char* no_affinity = std::getenv("VI_NO_AFFINITY");
+  if (threads_ > 1 && !(no_affinity && std::atoi(no_affinity))) {
+    const std::vector<int> cpus = one_cpu_per_core(threads_);
+    if (static_cast<int>(cpus.size()) == threads_) {
+      cpu_set_t set;
+      CPU_ZERO(&set);
+      CPU_SET(cpus[0], &set);
+      sched_setaffinity(0, sizeof(set), &set);  // calling (main) thread
+      for (int i = 1; i < threads_; ++i) {
+        CPU_ZERO(&set);
+        CPU_SET(cpus[i], &set);
+        pthread_setaffinity_np(impl_->threads[static_cast<size_t>(i - 1)].native_handle(),
+                               sizeof(set), &set);
+      }
+    }
+  }
+#endif
 }
 
 Pool::~Pool() {

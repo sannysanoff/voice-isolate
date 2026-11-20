@@ -18,7 +18,7 @@ void usage() {
       "\n"
       "options:\n"
       "  --model DIR          weight directory (default: model)\n"
-      "  --block-frames N     frames computed together (default 4)\n"
+      "  --block-frames N     frames computed together (default 6)\n"
       "  --window-frames N    time-attention window; 0 = unbounded (default 600)\n"
       "  --crossfade-frames N crossfade before each boundary (default 200)\n"
       "  --cache-frames N     attention lookback (default: checkpoint)\n"
@@ -46,6 +46,8 @@ int main(int argc, char** argv) {
   std::string quant_name = "fp32";
   bool fp16_kv = false;
   bool fp16_kv_explicit = false;
+  bool int8_kv = false;
+  bool int8_kv_explicit = false;
   bool filter = false;
   bool quiet = false;
   int chunk = 480;
@@ -88,6 +90,7 @@ int main(int argc, char** argv) {
       else { usage(); return 2; }
     }
     else if (arg == "--fp16-kv") { fp16_kv = true; fp16_kv_explicit = true; }
+    else if (arg == "--int8-kv") { int8_kv = true; int8_kv_explicit = true; }
     else if (arg == "--filter") filter = true;
     else if (arg == "--quiet") quiet = true;
     else if (arg == "--profile") vi::Model::profile_enabled() = true;
@@ -104,9 +107,16 @@ int main(int argc, char** argv) {
     auto model = std::make_shared<vi::Model>(model_dir);
     model->set_device(device);
     model->set_quant_mode(quant_mode);
-    if (fp16_kv_explicit)
+    if (fp16_kv_explicit) {
       model->set_fp16_kv(fp16_kv);
-    else if (quant_mode != vi::Model::QuantMode::Fp32)
+      model->set_int8_kv(false);
+    } else if (int8_kv_explicit) {
+      model->set_int8_kv(int8_kv);
+      model->set_fp16_kv(false);
+    } else if (quant_mode == vi::Model::QuantMode::Int8) {
+      // x86 AVX2 int8 KV: 4x less KV traffic at fp32 accumulation accuracy.
+      model->set_int8_kv(true);
+    } else if (quant_mode != vi::Model::QuantMode::Fp32)
       model->set_fp16_kv(true);
     vi::Stream stream(model, options);
     if (!quiet) {
@@ -129,7 +139,8 @@ int main(int argc, char** argv) {
                    vi::default_pool().size(),
                    w_mode,
                    w_accel,
-                   model->fp16_kv() ? " + fp16-kv" : "",
+                   model->int8_kv() ? " + int8-kv"
+                                    : (model->fp16_kv() ? " + fp16-kv" : ""),
                    stream.lookahead_frames(),
                    stream.latency_samples(),
                    1000.0 * stream.latency_samples() / stream.sample_rate(),
@@ -189,11 +200,20 @@ int main(int argc, char** argv) {
                      "  decode %.2f  (stages %.2f of %.2f s = %.0f%%)\n"
                      "    gemm %.2f  ln %.2f  scores %.2f  pv %.2f  rope %.2f"
                      "  transpose %.2f  mconv %.2f  scan %.2f  add %.2f"
-                     "  corr %.2f  ola %.2f\n",
+                     "  corr %.2f  ola %.2f  elem %.2f  gflops %.1f fp32 %.1f%% quant %.2f\n"
+                     "    attn_w qk %.2f  soft %.2f  pv %.2f  ortho %.2f  store %.2f\n",
                      p.encode, p.time_attn, p.band_attn, p.mamba, p.decode,
                      stage, seconds, 100.0 * stage / seconds, p.gemm, p.ln,
                      p.attn_scores, p.attn_pv, p.rope, p.transpose, p.mamba_conv,
-                     p.mamba_scan, p.add, p.corr, p.ola);
+                     p.mamba_scan, p.add, p.corr, p.ola, p.elem,
+                     p.gemm > 0 ? p.gemm_flops / p.gemm / 1e9 : 0,
+                     p.gemm_flops > 0
+                         ? 100.0 * p.gemm_fp32_flops / p.gemm_flops
+                         : 0,
+                     p.gemm_quant,
+                     p.attn_qk_w.load(), p.attn_soft_w.load(),
+                     p.attn_pv_w.load(), p.attn_ortho_w.load(),
+                     p.attn_store_w.load());
       const double audio_seconds =
           static_cast<double>(audio.samples.size()) / audio.sample_rate;
       std::fprintf(stderr, "%s: %.2f s audio in %.2f s (%.2fx realtime)\n",

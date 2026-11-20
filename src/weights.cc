@@ -4,6 +4,10 @@
 #include <fstream>
 #include <sstream>
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
+
 namespace vi {
 namespace {
 
@@ -54,6 +58,11 @@ void Weights::load(const std::string& dir) {
   if (!blob.read(reinterpret_cast<char*>(blob_.data()),
                  static_cast<std::streamsize>(blob_.size() * sizeof(float))))
     throw std::runtime_error("short read on " + join(dir, "weights.bin"));
+#if defined(__linux__)
+  // The blob (232 MB) is streamed every block; on madvise-mode THP systems
+  // huge pages cut the per-block TLB misses ~500x. Silent no-op otherwise.
+  madvise(blob_.data(), blob_.size() * sizeof(float), MADV_HUGEPAGE);
+#endif
 
   for (const auto& entry : entries) {
     Tensor tensor;

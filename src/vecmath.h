@@ -95,6 +95,22 @@ void v_linear_4rows(const float* a, int k, const float* w, int n,
 void v_quant_pack_a_i8_block(const float* a, int m0, int mr, int k, int lda,
                              int8_t* ap_block, float* scales);
 
+// x86 AVX2 int8 KV cache (per-token symmetric quant, fp32 accumulation).
+// Keys/values stored as int8 + one fp32 scale per slot; QK/PV dequantize on
+// the fly. ~4x less KV traffic than fp32 at fp32 accumulation accuracy.
+bool kv_i8_available();
+void v_quantize_kv_row(const float* src, int8_t* dst, int n, float* scale);
+void v_attn4_qk_i8(const float* q0, const float* q1, const float* q2,
+                   const float* q3, const int8_t* keys, const float* kscales,
+                   int n, int hd, float scale, float* s0, float* s1,
+                   float* s2, float* s3);
+void v_attn4_pv_i8(float* p0, float* p1, float* p2, float* p3,
+                   const int8_t* values, const float* vscales, int n, int hd,
+                   float* o0, float* o1, float* o2, float* o3);
+// Inverse-RoPE + requantize for one cached key slot (cache-trim path).
+void v_rope_i8_inplace(int8_t* x, float* sc, int hd, const float* cos,
+                       const float* sin, bool inverse);
+
 // FP16 KV-cache helpers (hardware NEON FP16 when available, else software fallback).
 bool fp16_neon_available();
 void v_f32_to_f16(const float* src, uint16_t* dst, int n);

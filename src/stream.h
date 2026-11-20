@@ -12,7 +12,7 @@
 namespace vi {
 
 struct StreamOptions {
-  int block_frames = 4;      // frames computed together; throughput only
+  int block_frames = 6;      // frames computed together; throughput only (x86: ~1.05-1.08x realtime int8)
   int window_frames = 600;   // time-attention window; 0 = unbounded
   int crossfade_frames = 200;
   int cache_frames = 0;      // 0 = the checkpoint's attention window

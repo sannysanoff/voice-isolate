@@ -15,6 +15,14 @@ merged after the full-file x86 benchmark; measure the current source again
 before treating the older measurements as its baseline. Check `git status`,
 branch and remote history before starting, and preserve any subsequent work.
 
+> **Status update (2026-11-20):** the realtime goal **is met** for the int8
+> streaming path on the second x86 machine below (Ryzen 7 7435HS, 8 threads,
+> **1.08× realtime**). It remains unmet on the original Ryzen 9 3900X and for
+> fp32 on x86, and no Intel CPU has been tested. The final stage, including the
+> changed default block size that affects all future comparisons, is appended
+> at the end of this document. The statement above is kept as the historical
+> starting point.
+
 ## Workload and machine
 
 The measurements so far used Linux on an **AMD Ryzen 9 3900X**, with 12 CPUs
@@ -135,3 +143,90 @@ option, use a separate build directory or explicitly clear it. OpenBLAS is an
 optional external dependency, not bundled. In the measured environment the
 library used was `/usr/local/lib/ollama/mlx_cuda_v13/libopenblas.so.0` (version
 0.3.15), which is machine-specific and should not be hard-coded in source.
+
+---
+
+## Final stage: x86 int8 realtime goal met (Ryzen 7 7435HS, 2026-11-20)
+
+### What changed since the previous handoff
+
+A second x86 host was used after the throttled 3900X runs: **AMD Ryzen 7
+7435HS**, 8 physical cores / 16 SMT threads, AVX2+FMA, **no AVX-512, no
+AVX-VNNI, no fp16 arithmetic**, ~4.2 GHz under load, no thermal throttling
+during the timed runs. GCC 13.3.0, Release `-O3 -march=native -fno-math-errno`,
+Eigen 3.4.0 / xsimd 13.2.0, no OpenBLAS. All runs used eight threads, the
+44.29 s WAV, 600-frame window and 200-frame crossfade; times below are CLI
+processing time (model load excluded). Full detail and rejected experiments
+are in `progress.md`.
+
+**Important for future comparisons:** the default `StreamOptions::block_frames`
+changed from **4 to 6** (`src/stream.h`, CLI help updated). To reproduce any
+earlier bf4 number you must now pass `--block-frames 4` explicitly. Six frames
+is a throughput-only change in this codebase, but it is not bit-identical to
+bf4; measured int8 SNR vs the matching fp32 output was 23.32 dB at bf4 and
+23.40 dB at bf6 (bf8 was 21.62 dB, so bf8 was rejected despite being faster).
+
+The changes that mattered, in order of measured effect:
+
+1. `src/gemm_avx2.cc`: forced `tile<Rows>()` to `always_inline`. `nm` showed
+   GCC emitting it as a standalone symbol (the `target("avx2")` attribute
+   prevented inlining), which cost ~37% of kernel throughput: 187 -> 253 GOPS
+   on an isolated 184x512x1536 layer. The epilogue is now specialized through a
+   `gemm_tiles_impl<WithBias>()` helper rather than a lambda, so the
+   `VI_NATIVE=OFF` build still compiles (a lambda loses the target attribute).
+2. `src/pool.cc`: on Linux x86, pin one worker per physical core using
+   `/sys/.../topology/core_id` and the process's allowed CPU mask. SMT placement
+   otherwise stacked two workers on one core. `VI_NO_AFFINITY=1` disables it;
+   the fallback is unchanged when fewer than `threads` distinct cores exist.
+   The pre-existing x86 "stay parked across timeout checks" spin behaviour was
+   preserved.
+3. `src/gemm_avx2.cc`: load the 16 per-column offset values once per tile
+   instead of once per row. Kept the original column-major j-outer loop; a
+   row-major nesting was slower in the real per-worker workload.
+4. `src/stream.h`: default block size 6 (see caveat above).
+
+### Result and verification
+
+| Step (int8, 8 threads, full file) | Processing | Realtime |
+|---|---:|---:|
+| Starting build (bf4, no inlining, default affinity) | 51.5 s | 0.86x |
+| `tile()` forced inline | 48.8 s | 0.91x |
+| + column-major nesting + one-core-per-thread affinity | 44.2 s | 1.00x |
+| + default bf6 (current) | 40.9-41.1 s | **1.08x** |
+
+- Output: 2,125,746 samples (matches `clean2.wav`).
+- Quality: 23.40 dB SNR, max abs error 0.0905, both vs matching-fp32 and vs the
+  supplied PCM16 reference. int8 is clearly labelled low precision; fp32 stays
+  the reference path.
+- `ctest --output-on-failure` passes for both `-march=native` and
+  `VI_NATIVE=OFF` builds. As before, the optional `ref/` fixtures were absent,
+  so the Python stage/windowed/cache-compaction comparisons are skipped, not
+  passed. No ARM or Metal backend was exercised on this host.
+- Reproduce with:
+  ```sh
+  cmake -S . -B build-opt -DCMAKE_BUILD_TYPE=Release
+  cmake --build build-opt -j8
+  ./build-opt/voice-isolate-cli \
+    audio_7082000Hz_18-59-39_25-06-2024-L20-endfed-maticna.wav \
+    /tmp/voice-isolate-x86-int8-final.wav \
+    --quant int8 --threads 8 --profile
+  ```
+
+### What was tried and rejected here
+
+AVX2 k-unrolling, 8-row split tiles, hand-written AVX2 2-key/4-key attention QK
+tiling (slower than xsimd's existing 60 GOPS path), LTO, bias-template
+specialization alone, 4/6/7 thread counts (8 with affinity is best), bf8
+(speed 1.11x but 1.7 dB quality loss), and changing the pool spin reset
+(negligible wall time, more user CPU). The kernel is near the AVX2 ceiling:
+~253 of ~270 GOPS single-threaded, since `vpmaddubsw`/`vpmaddwd` is the only
+int8 multiply available without VNNI.
+
+### Open items
+
+- No actual **Intel** CPU was measured; all x86 numbers are AMD. The original
+  3900X remains at 0.42x (OpenBLAS fp32) / 0.38-0.39x (early int8) and is throttled.
+- fp32 on x86 is still far from realtime (~80 s on the 7435HS); only int8
+  reaches the target.
+- The `ref/` fixtures are still needed to turn the skipped CTest comparisons
+  into real reference checks.
